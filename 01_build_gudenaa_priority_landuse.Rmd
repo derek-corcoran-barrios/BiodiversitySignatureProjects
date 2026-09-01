@@ -12,7 +12,7 @@ params:
   subclasses_file: "Datasets/Subclasses.tif"
   markblokkort_file: "Datasets/Rast_markblokkort_Croped.tif"
   markblokkort_field: "MB_TYPE"
-  gudenaa_file: "Datasets/gudenaa_kommune.shp"
+  gudenaa_file: "Datasets/greater_area_gudenaaen.shp"
   output_dir: "Predictors/gudenaa_landuse"
   forest_nature_rule: "subclasses_skovnatur"
   overwrite: false
