@@ -1,0 +1,644 @@
+---
+title: "Build priority land-use rasters for Denmark and Silkeborg"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  basemap_file: "Datasets/lu_01_2018.tif"
+  basemap_vat_file: "Datasets/lu_01_2018.tif.vat.dbf"
+  basemap_reclass_file: "Datasets/Basemap_all_cat_reclass_SN_05_2023.csv"
+  subclasses_file: "Datasets/Subclasses.tif"
+  markblokkort_file: "Datasets/Rast_markblokkort_Croped.tif"
+  markblokkort_field: "MB_TYPE"
+  silkeborg_file: "Datasets/Silkeborg_kommune.shp"
+  output_dir: "Predictors/silkeborg_landuse"
+  forest_nature_rule: "subclasses_skovnatur"
+  overwrite: false
+---
+
+<!-- Edit this Rmd, then knit it. The code is also safe to run chunk by chunk. -->
+
+# Purpose
+
+This workflow combines four sources into one categorical land-use system:
+
+1. the eight `SN_ModelClass` nature types derived from Basemap03;
+2. agriculture from Markblokkort;
+3. urban and infrastructure classes from Basemap03; and
+4. production forest from the **national Basemap forest footprint**.
+
+The last point is deliberate. `Subclasses == "Drevet Skov"` only identifies
+managed forest inside the protection-scheme footprint. It is useful as an
+audit, but it cannot be the source for production forest across the whole
+country. Here, all Basemap forest (`311000` and `312000`) is treated as
+production forest unless it is explicitly retained as forest nature.
+
+It writes a national current raster for model fitting and threshold calibration,
+then crops that exact raster to Silkeborg for current and scenario projections.
+The two rasters therefore use the same codes and factor levels.
+
+The priority order is:
+
+1. nature type;
+2. agriculture;
+3. urban/infrastructure;
+4. production forest; and
+5. other land.
+
+Thus, a natural habitat is not overwritten merely because it intersects a
+Markblokkort polygon. Agriculture still takes priority over production forest,
+and urban land is never included in a restoration scenario.
+
+# Input folder
+
+Place the source files under `Datasets/` using the parameter names above. The
+Basemap value-attribute table supplied with `lu_01_2018.tif` is essential: its
+`C_19` field provides the stable aggregated classes used for urban and forest.
+
+`markblokkort_file` may be either:
+
+- a categorical raster whose cells are `INT_AGG`, `PGR`, or the original
+  Markblokkort classes; or
+- a vector file with the class field named by `markblokkort_field`.
+
+The categorical baseline is built nationally because model fitting should use
+the Danish occurrence records and a national predictor domain. Only the final
+projection copy is cropped to Silkeborg. CHELSA is **not** upscaled nationally;
+the second document aligns climate at 10 m only for the small municipality.
+
+# Data provenance and redistribution
+
+Basemap03 is an Aarhus University/DCE analytical product and is not legally
+binding. Cite the Basemap03 technical documentation (Levin 2019) in analyses
+that use this derivative. The derived rasters, Markblokkort data and project
+`Subclasses` layer must retain their respective source terms and internal data
+agreements. In particular, do not add large or restricted source rasters to a
+public Git repository merely because this script can reproduce the derivative;
+track paths/manifests and documentation in Git, and store the spatial inputs in
+the approved data location.
+
+```{r setup}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  error = FALSE,
+  message = TRUE,
+  warning = TRUE
+)
+
+required_packages <- c(
+  "terra", "foreign", "dplyr", "readr", "stringr", "tibble", "knitr"
+)
+
+missing_packages <- setdiff(
+  required_packages,
+  rownames(utils::installed.packages())
+)
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the missing packages first: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+library(terra)
+library(dplyr)
+
+terra::terraOptions(progress = 1L, threads = 1L)
+```
+
+# Fixed class dictionary
+
+The IDs are fixed rather than generated from first-seen order. This guarantees
+that current and scenario rasters have exactly the same interpretation.
+
+```{r class-dictionary}
+landuse_legend <- tibble::tribble(
+  ~id, ~class,                  ~role,
+    1, "ForestDryPoor",        "nature",
+    2, "ForestWetPoor",        "nature",
+    3, "ForestDryRich",        "nature",
+    4, "ForestWetRich",        "nature",
+    5, "OpenDryPoor",          "nature",
+    6, "OpenWetPoor",          "nature",
+    7, "OpenDryRich",          "nature",
+    8, "OpenWetRich",          "nature",
+    9, "Agriculture",          "convertible",
+   10, "Urban",                "fixed",
+   11, "ProductionForest",     "convertible",
+   12, "Other",                "fixed"
+)
+
+nature_codes <- stats::setNames(
+  landuse_legend$id[landuse_legend$role == "nature"],
+  landuse_legend$class[landuse_legend$role == "nature"]
+)
+
+code_for <- function(class_name) {
+  out <- landuse_legend$id[match(class_name, landuse_legend$class)]
+  if (length(out) != 1L || is.na(out)) {
+    stop("Unknown land-use class: ", class_name, call. = FALSE)
+  }
+  out
+}
+
+knitr::kable(landuse_legend)
+```
+
+# Helpers
+
+```{r helpers}
+assert_files_exist <- function(paths) {
+  missing <- paths[!file.exists(paths)]
+  if (length(missing) > 0L) {
+    stop(
+      "Missing input files:\n- ",
+      paste(missing, collapse = "\n- "),
+      call. = FALSE
+    )
+  }
+  invisible(paths)
+}
+
+align_categorical <- function(x, template) {
+  x <- terra::crop(x, terra::ext(template), snap = "out")
+
+  if (!terra::compareGeom(x, template, stopOnError = FALSE)) {
+    x <- terra::project(x, template, method = "near")
+  }
+
+  if (!terra::compareGeom(x, template, stopOnError = FALSE)) {
+    stop("A categorical input could not be aligned to Basemap.", call. = FALSE)
+  }
+
+  terra::mask(x, template)
+}
+
+count_true <- function(x) {
+  as.numeric(
+    terra::global(
+      terra::ifel(!is.na(x) & x, 1, 0),
+      fun = "sum",
+      na.rm = TRUE
+    )[1, 1]
+  )
+}
+
+write_landuse_raster <- function(x, filename, overwrite = FALSE) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+
+  terra::writeRaster(
+    x,
+    filename = filename,
+    overwrite = overwrite,
+    datatype = "INT1U",
+    NAflag = 255,
+    gdal = c(
+      "COMPRESS=DEFLATE",
+      "PREDICTOR=2",
+      "TILED=YES",
+      "BIGTIFF=IF_SAFER"
+    )
+  )
+
+  filename
+}
+
+read_agriculture_mask <- function(
+    path,
+    template,
+    field = "MB_TYPE",
+    accepted = c("OMD", "PGR", "ING", "PAF", "MIX", "VKS", "INT_AGG")) {
+  raster_extensions <- c(".tif", ".tiff", ".vrt", ".img")
+  extension <- tolower(tools::file_ext(path))
+
+  if (paste0(".", extension) %in% raster_extensions) {
+    agriculture <- align_categorical(terra::rast(path), template)
+    category_tables <- terra::levels(agriculture)
+    category_table <- if (length(category_tables) > 0L) {
+      category_tables[[1]]
+    } else {
+      NULL
+    }
+
+    if (!is.null(category_table) && ncol(category_table) >= 2L) {
+      return(agriculture %in% accepted)
+    }
+
+    # Numeric Markblokkort rasters are commonly 1/NA or 1/0. Zero is treated
+    # as background; any other finite value is agricultural land.
+    return(!is.na(agriculture) & agriculture != 0)
+  }
+
+  agriculture <- terra::vect(path)
+  if (!field %in% names(agriculture)) {
+    stop(
+      "The Markblokkort vector must contain `", field, "`.",
+      call. = FALSE
+    )
+  }
+
+  agriculture <- agriculture[agriculture[[field]] %in% accepted, ]
+  if (nrow(agriculture) == 0L) {
+    stop("No accepted Markblokkort polygons were found.", call. = FALSE)
+  }
+
+  agriculture <- terra::project(agriculture, terra::crs(template))
+  terra::rasterize(agriculture, template, field = 1, background = 0) == 1
+}
+```
+
+# Validate and read inputs
+
+```{r read-inputs}
+assert_files_exist(c(
+  params$basemap_file,
+  params$basemap_vat_file,
+  params$basemap_reclass_file,
+  params$subclasses_file,
+  params$markblokkort_file,
+  params$silkeborg_file
+))
+
+basemap <- terra::rast(params$basemap_file)
+if (terra::nlyr(basemap) != 1L) {
+  stop("The Basemap input must contain exactly one layer.", call. = FALSE)
+}
+
+silkeborg <- terra::vect(params$silkeborg_file)
+silkeborg <- terra::makeValid(silkeborg)
+silkeborg <- terra::aggregate(silkeborg)
+silkeborg <- terra::project(silkeborg, terra::crs(basemap))
+
+basemap_template <- basemap
+
+names(basemap_template) <- "Basemap_value"
+
+vat <- foreign::read.dbf(params$basemap_vat_file, as.is = TRUE)
+reclass <- utils::read.csv(
+  params$basemap_reclass_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+required_vat_columns <- c("Value", "C_19")
+required_reclass_columns <- c("Value1", "SN_ModelClass")
+
+if (!all(required_vat_columns %in% names(vat))) {
+  stop(
+    "The Basemap VAT must contain: ",
+    paste(required_vat_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!all(required_reclass_columns %in% names(reclass))) {
+  stop(
+    "The reclassification CSV must contain: ",
+    paste(required_reclass_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+```
+
+# Join the Basemap tables
+
+The Basemap03 VAT supplied for this project uses the following aggregate codes:
+
+- `110000`--`160000`: urban, roads, infrastructure, recreation and extraction;
+- `311000` and `312000`: forest and wet forest.
+
+Agriculture is taken from Markblokkort, not inferred from these codes.
+
+```{r join-basemap-tables}
+reclass_clean <- reclass |>
+  dplyr::transmute(
+    Value1 = as.numeric(.data$Value1),
+    SN_ModelClass = stringr::str_trim(
+      sub("Both$", "Rich", .data$SN_ModelClass)
+    )
+  )
+
+rat <- vat |>
+  dplyr::mutate(
+    Value = as.numeric(.data$Value),
+    C_19 = as.integer(.data$C_19)
+  ) |>
+  dplyr::left_join(reclass_clean, by = c("Value" = "Value1"))
+
+duplicate_labels <- rat |>
+  dplyr::filter(!is.na(.data$SN_ModelClass)) |>
+  dplyr::distinct(.data$Value, .data$SN_ModelClass) |>
+  dplyr::count(.data$Value) |>
+  dplyr::filter(.data$n > 1L)
+
+if (nrow(duplicate_labels) > 0L) {
+  stop("Some Basemap values have more than one SN model class.", call. = FALSE)
+}
+
+unknown_nature_labels <- setdiff(
+  unique(stats::na.omit(rat$SN_ModelClass)),
+  c(names(nature_codes), "Exclude")
+)
+
+if (length(unknown_nature_labels) > 0L) {
+  stop(
+    "Unrecognised SN_ModelClass labels: ",
+    paste(unknown_nature_labels, collapse = ", "),
+    call. = FALSE
+  )
+}
+```
+
+# Build source masks
+
+Open nature is accepted wherever the SN reclassification identifies an open
+nature type. Forest nature is more conservative: by default it requires
+`Subclasses == "Skovnatur"`. Every remaining Basemap forest cell is available
+to the production-forest class. Set `forest_nature_rule` to `all_sn_forest` only
+if the SN forest classes have independently been verified to exclude managed
+forest.
+
+```{r source-masks}
+nature_lookup <- rat |>
+  dplyr::transmute(
+    old = .data$Value,
+    new = unname(nature_codes[.data$SN_ModelClass])
+  ) |>
+  dplyr::filter(!is.na(.data$old), !is.na(.data$new)) |>
+  dplyr::distinct()
+
+if (nrow(nature_lookup) == 0L) {
+  stop("No Basemap values mapped to the eight nature types.", call. = FALSE)
+}
+
+nature_candidate <- terra::classify(
+  basemap_template,
+  rcl = as.matrix(nature_lookup),
+  others = NA
+)
+
+subclasses <- params$subclasses_file |>
+  terra::rast() |>
+  align_categorical(basemap_template)
+
+agriculture_mask <- read_agriculture_mask(
+  path = params$markblokkort_file,
+  template = basemap_template,
+  field = params$markblokkort_field
+)
+
+forest_basemap_values <- rat |>
+  dplyr::filter(.data$C_19 %in% c(311000L, 312000L)) |>
+  dplyr::pull(.data$Value) |>
+  unique()
+
+urban_basemap_values <- rat |>
+  dplyr::filter(dplyr::between(.data$C_19, 110000L, 160000L)) |>
+  dplyr::pull(.data$Value) |>
+  unique()
+
+forest_mask <- basemap_template %in% forest_basemap_values
+urban_mask <- basemap_template %in% urban_basemap_values
+
+open_codes <- landuse_legend$id[
+  startsWith(landuse_legend$class, "Open")
+]
+forest_codes <- landuse_legend$id[
+  startsWith(landuse_legend$class, "Forest")
+]
+
+open_nature_mask <- nature_candidate %in% open_codes
+
+if (identical(params$forest_nature_rule, "subclasses_skovnatur")) {
+  forest_nature_mask <-
+    nature_candidate %in% forest_codes &
+    subclasses %in% "Skovnatur"
+} else if (identical(params$forest_nature_rule, "all_sn_forest")) {
+  forest_nature_mask <- nature_candidate %in% forest_codes
+} else {
+  stop(
+    "`forest_nature_rule` must be `subclasses_skovnatur` or ",
+    "`all_sn_forest`.",
+    call. = FALSE
+  )
+}
+
+nature_mask <- open_nature_mask | forest_nature_mask
+nature_layer <- terra::ifel(nature_mask, nature_candidate, NA)
+```
+
+# Apply the priority hierarchy
+
+Assignments are made from lowest to highest priority. The final `cover()` puts
+the eight nature classes on top.
+
+```{r priority-landuse}
+denmark_domain_values <- rat |>
+  dplyr::filter(
+    !.data$C_19 %in% c(
+      420000L, # sea
+      800000L, # unmapped
+      999999L  # Germany
+    )
+  ) |>
+  dplyr::pull(.data$Value) |>
+  unique()
+
+domain <- basemap_template %in% denmark_domain_values
+
+landuse <- terra::ifel(domain, code_for("Other"), NA)
+landuse <- terra::ifel(
+  forest_mask,
+  code_for("ProductionForest"),
+  landuse
+)
+landuse <- terra::ifel(urban_mask, code_for("Urban"), landuse)
+landuse <- terra::ifel(
+  agriculture_mask,
+  code_for("Agriculture"),
+  landuse
+)
+landuse <- terra::cover(nature_layer, landuse)
+names(landuse) <- "Landuse"
+
+class_table <- as.data.frame(landuse_legend[c("id", "class")])
+terra::levels(landuse) <- class_table
+
+landuse_silkeborg <- landuse |>
+  terra::crop(silkeborg, snap = "out") |>
+  terra::mask(silkeborg)
+names(landuse_silkeborg) <- "Landuse"
+terra::levels(landuse_silkeborg) <- class_table
+```
+
+# Validation and the production-forest check
+
+The audit explicitly reports how much production forest would have been found
+from `Subclasses == "Drevet Skov"` and how much is found from Basemap. A large
+difference is expected and is the reason for the revised method.
+
+```{r validate}
+if (!terra::compareGeom(landuse, basemap_template, stopOnError = FALSE)) {
+  stop("The final land-use raster lost the Basemap geometry.", call. = FALSE)
+}
+
+observed_ids <- terra::freq(as.numeric(landuse), value = TRUE)
+if (!all(observed_ids$value %in% landuse_legend$id)) {
+  stop("The final raster contains an unknown class ID.", call. = FALSE)
+}
+
+subclasses_managed_forest <- subclasses %in% "Drevet Skov"
+forest_outside_subclasses <- forest_mask & is.na(subclasses)
+
+source_audit <- tibble::tibble(
+  measure = c(
+    "all_basemap_forest_cells",
+    "subclasses_drevet_skov_cells",
+    "basemap_forest_outside_subclasses_cells",
+    "final_production_forest_cells",
+    "final_agriculture_cells",
+    "final_urban_cells",
+    "final_nature_cells"
+  ),
+  cells = c(
+    count_true(forest_mask),
+    count_true(subclasses_managed_forest),
+    count_true(forest_outside_subclasses),
+    count_true(landuse == code_for("ProductionForest")),
+    count_true(landuse == code_for("Agriculture")),
+    count_true(landuse == code_for("Urban")),
+    count_true(landuse %in% landuse_legend$id[landuse_legend$role == "nature"])
+  )
+)
+
+if (source_audit$cells[source_audit$measure ==
+    "basemap_forest_outside_subclasses_cells"] == 0) {
+  warning(
+    "No Basemap forest was found outside Subclasses. Confirm that ",
+    "Subclasses is really restricted to protection schemes.",
+    call. = FALSE
+  )
+}
+
+cell_area_km2 <- terra::cellSize(landuse, unit = "km")
+area_by_class <- terra::zonal(
+  cell_area_km2,
+  as.numeric(landuse),
+  fun = "sum",
+  na.rm = TRUE
+)
+names(area_by_class) <- c("id", "area_km2")
+
+class_audit <- landuse_legend |>
+  dplyr::left_join(area_by_class, by = "id") |>
+  dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
+
+silkeborg_cell_area_km2 <- terra::cellSize(
+  landuse_silkeborg,
+  unit = "km"
+)
+silkeborg_area_by_class <- terra::zonal(
+  silkeborg_cell_area_km2,
+  as.numeric(landuse_silkeborg),
+  fun = "sum",
+  na.rm = TRUE
+)
+names(silkeborg_area_by_class) <- c("id", "area_km2")
+
+silkeborg_class_audit <- landuse_legend |>
+  dplyr::left_join(silkeborg_area_by_class, by = "id") |>
+  dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
+
+knitr::kable(source_audit)
+knitr::kable(class_audit, digits = 3)
+knitr::kable(silkeborg_class_audit, digits = 3)
+```
+
+# Write outputs
+
+```{r write-outputs}
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+national_landuse_path <- file.path(
+  params$output_dir,
+  "Landuse_Denmark_current.tif"
+)
+silkeborg_landuse_path <- file.path(
+  params$output_dir,
+  "Landuse_Silkeborg_current.tif"
+)
+legend_path <- file.path(params$output_dir, "Landuse_class_legend.csv")
+source_audit_path <- file.path(
+  params$output_dir,
+  "Landuse_source_audit.csv"
+)
+class_audit_path <- file.path(
+  params$output_dir,
+  "Landuse_Denmark_class_area_audit.csv"
+)
+silkeborg_class_audit_path <- file.path(
+  params$output_dir,
+  "Landuse_Silkeborg_class_area_audit.csv"
+)
+national_path_manifest <- file.path(
+  params$output_dir,
+  "landuse_Denmark_current_path.rds"
+)
+silkeborg_path_manifest <- file.path(
+  params$output_dir,
+  "landuse_Silkeborg_current_path.rds"
+)
+
+write_landuse_raster(
+  landuse,
+  filename = national_landuse_path,
+  overwrite = params$overwrite
+)
+write_landuse_raster(
+  landuse_silkeborg,
+  filename = silkeborg_landuse_path,
+  overwrite = params$overwrite
+)
+readr::write_csv(landuse_legend, legend_path)
+readr::write_csv(source_audit, source_audit_path)
+readr::write_csv(class_audit, class_audit_path)
+readr::write_csv(silkeborg_class_audit, silkeborg_class_audit_path)
+saveRDS(national_landuse_path, national_path_manifest)
+saveRDS(silkeborg_landuse_path, silkeborg_path_manifest)
+
+c(
+  national_landuse = national_landuse_path,
+  silkeborg_landuse = silkeborg_landuse_path,
+  legend = legend_path,
+  source_audit = source_audit_path,
+  national_class_audit = class_audit_path,
+  silkeborg_class_audit = silkeborg_class_audit_path,
+  national_manifest = national_path_manifest,
+  silkeborg_manifest = silkeborg_path_manifest
+)
+```
+
+# Quick map
+
+```{r plot, fig.width=10, fig.height=7}
+plot(
+  landuse_silkeborg,
+  type = "classes",
+  main = "Priority land use — Silkeborg"
+)
+```
+
+# Interpretation
+
+This output is a **current land-use predictor**, not a protection-status map.
+`Subclasses` contributes the distinction between forest nature and managed
+forest, but Basemap supplies the complete forest footprint. Before modelling,
+inspect the audit and map, especially boundaries between `Forest*` and
+`ProductionForest`. If a separate authoritative unmanaged/natural-forest layer
+becomes available, merge it into `forest_nature_mask`; do not revert to using
+`Drevet Skov` alone for production forest.

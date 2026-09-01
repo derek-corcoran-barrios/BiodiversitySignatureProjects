@@ -1,0 +1,678 @@
+---
+title: "Build eight Silkeborg nature-restoration scenarios"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  national_current_landuse_file: "Predictors/silkeborg_landuse/Landuse_Denmark_current.tif"
+  current_landuse_file: "Predictors/silkeborg_landuse/Landuse_Silkeborg_current.tif"
+  landuse_legend_file: "Predictors/silkeborg_landuse/Landuse_class_legend.csv"
+  silkeborg_file: "Datasets/Silkeborg_kommune.shp"
+  current_climate_file: ""
+  current_predictor_manifest_file: "Predictors/current_predictor_paths.rds"
+  output_dir: "Predictors/silkeborg_scenarios"
+  overwrite: false
+---
+
+# Purpose
+
+This workflow starts from the priority land-use raster created by
+`01_build_silkeborg_priority_landuse.Rmd`. It creates eight counterfactual
+rasters. In each one, **every Agriculture and ProductionForest cell** is changed
+to one of the eight nature types.
+
+Existing nature, urban and other cells remain unchanged. The workflow also:
+
+- aligns the existing current CHELSA stack to the Silkeborg 10 m template;
+- writes separate national-training and local-projection manifests;
+- writes a scenario manifest in the list-column format used by
+  `SpeciesPoolR::load_one_scenario()`; and
+- audits geometry and the exact set of changed cells.
+
+These are deliberately extreme, single-endpoint scenarios. They answer “what
+if every convertible production cell became this nature type?” They do not yet
+encode feasibility, restoration time, dispersal, succession or partial uptake.
+
+The national/local split is essential. `FitSpeciesModels()` should use national
+land use and national CHELSA so Danish occurrence records remain inside the
+predictor domain. The national 10 m land-use raster is reduced to the existing
+CHELSA grid with nearest-neighbour resampling; CHELSA is not needlessly
+upsampled across all Denmark. Only current/scenario projections are restricted
+to Silkeborg. Do not replace the training predictors with the local manifest
+unless the scientific intention is to fit from Silkeborg records alone.
+
+```{r setup}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  error = FALSE,
+  message = TRUE,
+  warning = TRUE
+)
+
+required_packages <- c("terra", "dplyr", "readr", "tibble", "knitr")
+missing_packages <- setdiff(
+  required_packages,
+  rownames(utils::installed.packages())
+)
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the missing packages first: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+library(terra)
+library(dplyr)
+
+# Parallelism belongs at the targets/crew level. Each raster worker should use
+# one GDAL/OpenMP thread to avoid nested oversubscription on the server.
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  VECLIB_MAXIMUM_THREADS = "1"
+)
+terra::terraOptions(progress = 1L, threads = 1L)
+```
+
+# Helpers
+
+```{r helpers}
+assert_files_exist <- function(paths) {
+  paths <- unique(as.character(paths))
+  paths <- paths[!is.na(paths) & nzchar(paths)]
+  missing <- paths[!file.exists(paths)]
+
+  if (length(missing) > 0L) {
+    stop(
+      "Missing input files:\n- ",
+      paste(missing, collapse = "\n- "),
+      call. = FALSE
+    )
+  }
+
+  invisible(paths)
+}
+
+snake_case <- function(x) {
+  x <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  tolower(gsub("^_+|_+$", "", x))
+}
+
+count_true <- function(x) {
+  as.numeric(
+    terra::global(
+      terra::ifel(!is.na(x) & x, 1, 0),
+      fun = "sum",
+      na.rm = TRUE
+    )[1, 1]
+  )
+}
+
+sum_where <- function(values, condition) {
+  as.numeric(
+    terra::global(
+      terra::ifel(condition, values, NA),
+      fun = "sum",
+      na.rm = TRUE
+    )[1, 1]
+  )
+}
+
+write_landuse_raster <- function(x, filename, overwrite = FALSE) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+
+  terra::writeRaster(
+    x,
+    filename = filename,
+    overwrite = overwrite,
+    datatype = "INT1U",
+    NAflag = 255,
+    gdal = c(
+      "COMPRESS=DEFLATE",
+      "PREDICTOR=2",
+      "TILED=YES",
+      "BIGTIFF=IF_SAFER"
+    )
+  )
+
+  filename
+}
+
+is_landuse_raster <- function(path) {
+  x <- terra::rast(path)
+  category_tables <- terra::levels(x)
+  has_categories <- length(category_tables) > 0L &&
+    !is.null(category_tables[[1]]) &&
+    nrow(category_tables[[1]]) > 0L
+
+  any(tolower(names(x)) == "landuse") ||
+    (terra::nlyr(x) == 1L && has_categories)
+}
+
+resolve_current_climate <- function(
+    explicit_path,
+    predictor_manifest,
+    current_landuse_path) {
+  if (!is.null(explicit_path) && nzchar(explicit_path)) {
+    assert_files_exist(explicit_path)
+    return(explicit_path)
+  }
+
+  assert_files_exist(predictor_manifest)
+  manifest_paths <- unique(unlist(readRDS(predictor_manifest), use.names = FALSE))
+  manifest_paths <- manifest_paths[
+    !is.na(manifest_paths) & nzchar(manifest_paths)
+  ]
+  assert_files_exist(manifest_paths)
+
+  normal_current_landuse <- normalizePath(
+    current_landuse_path,
+    winslash = "/",
+    mustWork = TRUE
+  )
+  normal_manifest <- normalizePath(
+    manifest_paths,
+    winslash = "/",
+    mustWork = TRUE
+  )
+
+  candidates <- manifest_paths[normal_manifest != normal_current_landuse]
+  candidates <- candidates[!vapply(candidates, is_landuse_raster, logical(1))]
+
+  if (length(candidates) != 1L) {
+    stop(
+      "Could not identify exactly one current climate stack in `", 
+      predictor_manifest, "`. Set `current_climate_file` explicitly. ",
+      "Candidates found: ", length(candidates),
+      call. = FALSE
+    )
+  }
+
+  candidates[[1]]
+}
+```
+
+# Read current land use and dictionary
+
+```{r read-landuse}
+assert_files_exist(c(
+  params$national_current_landuse_file,
+  params$current_landuse_file,
+  params$landuse_legend_file,
+  params$silkeborg_file
+))
+
+landuse_legend <- readr::read_csv(
+  params$landuse_legend_file,
+  show_col_types = FALSE
+)
+
+required_legend_columns <- c("id", "class", "role")
+if (!all(required_legend_columns %in% names(landuse_legend))) {
+  stop(
+    "The land-use legend must contain: ",
+    paste(required_legend_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+expected_nature_classes <- c(
+  "ForestDryPoor", "ForestWetPoor", "ForestDryRich", "ForestWetRich",
+  "OpenDryPoor", "OpenWetPoor", "OpenDryRich", "OpenWetRich"
+)
+
+if (!setequal(
+  landuse_legend$class[landuse_legend$role == "nature"],
+  expected_nature_classes
+)) {
+  stop("The legend does not contain the expected eight nature classes.", call. = FALSE)
+}
+
+code_for <- function(class_name) {
+  out <- landuse_legend$id[match(class_name, landuse_legend$class)]
+  if (length(out) != 1L || is.na(out)) {
+    stop("Unknown land-use class: ", class_name, call. = FALSE)
+  }
+  as.integer(out)
+}
+
+current_landuse <- terra::rast(params$current_landuse_file)
+if (terra::nlyr(current_landuse) != 1L) {
+  stop("Current land use must have exactly one layer.", call. = FALSE)
+}
+
+names(current_landuse) <- "Landuse"
+current_landuse_numeric <- as.numeric(current_landuse)
+
+national_current_landuse <- terra::rast(
+  params$national_current_landuse_file
+)
+if (terra::nlyr(national_current_landuse) != 1L) {
+  stop("National current land use must have exactly one layer.", call. = FALSE)
+}
+names(national_current_landuse) <- "Landuse"
+
+silkeborg <- params$silkeborg_file |>
+  terra::vect() |>
+  terra::makeValid() |>
+  terra::aggregate() |>
+  terra::project(terra::crs(current_landuse))
+
+current_landuse_numeric <- terra::mask(
+  current_landuse_numeric,
+  silkeborg
+)
+```
+
+# Align current CHELSA to the small template
+
+Only the Silkeborg extent is resampled to 10 m. Climate is continuous, so
+bilinear interpolation is used; land use is never bilinearly interpolated.
+
+```{r align-climate}
+current_climate_source <- resolve_current_climate(
+  explicit_path = params$current_climate_file,
+  predictor_manifest = params$current_predictor_manifest_file,
+  current_landuse_path = params$current_landuse_file
+)
+
+assert_files_exist(current_climate_source)
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+climate_output_path <- file.path(
+  params$output_dir,
+  "CHELSA_current_Silkeborg_10m.tif"
+)
+
+current_climate_source_raster <- terra::rast(current_climate_source)
+
+# Categorical training land use is placed on the existing national CHELSA
+# grid. This is far smaller and more honest than manufacturing national 10 m
+# climate values. Nearest neighbour is mandatory for the class IDs.
+training_landuse_output_path <- file.path(
+  params$output_dir,
+  "Landuse_Denmark_training_on_CHELSA_grid.tif"
+)
+
+training_landuse <- terra::project(
+  national_current_landuse,
+  current_climate_source_raster[[1]],
+  method = "near"
+)
+training_landuse <- terra::mask(
+  training_landuse,
+  current_climate_source_raster[[1]]
+)
+names(training_landuse) <- "Landuse"
+terra::levels(training_landuse) <- as.data.frame(
+  landuse_legend[c("id", "class")]
+)
+
+write_landuse_raster(
+  training_landuse,
+  filename = training_landuse_output_path,
+  overwrite = params$overwrite
+)
+
+if (!terra::compareGeom(
+  training_landuse,
+  current_climate_source_raster,
+  stopOnError = FALSE
+)) {
+  stop("National training land use does not match CHELSA.", call. = FALSE)
+}
+
+# Use a separate temporary file so GDAL never needs to overwrite a raster that
+# is still open. This matters especially on Windows servers.
+climate_projected_path <- tempfile(
+  pattern = "CHELSA_current_Silkeborg_projected_",
+  fileext = ".tif"
+)
+
+current_climate_projected <- terra::project(
+  current_climate_source_raster,
+  current_landuse_numeric,
+  method = "bilinear",
+  filename = climate_projected_path,
+  overwrite = TRUE,
+  wopt = list(
+    datatype = "FLT4S",
+    gdal = c(
+      "COMPRESS=DEFLATE",
+      "PREDICTOR=3",
+      "TILED=YES",
+      "BIGTIFF=IF_SAFER"
+    )
+  )
+)
+
+current_climate <- terra::mask(
+  current_climate_projected,
+  current_landuse_numeric,
+  filename = climate_output_path,
+  overwrite = params$overwrite,
+  wopt = list(
+    datatype = "FLT4S",
+    gdal = c("COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES")
+  )
+)
+
+rm(current_climate_projected)
+invisible(gc())
+unlink(climate_projected_path)
+
+if (!terra::compareGeom(
+  current_climate,
+  current_landuse_numeric,
+  stopOnError = FALSE
+)) {
+  stop("The aligned CHELSA stack does not match land use.", call. = FALSE)
+}
+
+finite_climate_cells <- terra::global(
+  terra::app(!is.na(current_climate), sum) == terra::nlyr(current_climate),
+  fun = "sum",
+  na.rm = TRUE
+)[1, 1]
+
+if (!is.finite(finite_climate_cells) || finite_climate_cells == 0) {
+  stop("Aligned CHELSA contains no cells complete across all bands.", call. = FALSE)
+}
+```
+
+# Scenario specification
+
+The conversion mask contains exactly two current classes. Urban and Other are
+fixed, and existing nature cells keep their current class.
+
+```{r scenario-specification}
+convertible_ids <- c(
+  code_for("Agriculture"),
+  code_for("ProductionForest")
+)
+
+scenario_table <- landuse_legend |>
+  dplyr::filter(.data$role == "nature") |>
+  dplyr::transmute(
+    scenario = paste0("all_to_", vapply(.data$class, snake_case, character(1))),
+    target_id = as.integer(.data$id),
+    target_class = .data$class
+  ) |>
+  dplyr::arrange(.data$target_id)
+
+if (nrow(scenario_table) != 8L) {
+  stop("Exactly eight nature scenarios are required.", call. = FALSE)
+}
+
+convertible_mask <- current_landuse_numeric %in% convertible_ids
+convertible_cells <- count_true(convertible_mask)
+
+if (convertible_cells == 0L) {
+  stop(
+    "No Agriculture or ProductionForest cells occur in the current map.",
+    call. = FALSE
+  )
+}
+
+cell_area_km2 <- terra::cellSize(current_landuse_numeric, unit = "km")
+convertible_area_km2 <- sum_where(cell_area_km2, convertible_mask)
+
+knitr::kable(scenario_table)
+```
+
+# Write the eight land-use rasters
+
+```{r build-scenarios}
+scenario_directory <- file.path(params$output_dir, "landuse")
+dir.create(scenario_directory, recursive = TRUE, showWarnings = FALSE)
+
+scenario_results <- vector("list", nrow(scenario_table))
+
+for (i in seq_len(nrow(scenario_table))) {
+  scenario_name <- scenario_table$scenario[[i]]
+  target_id <- scenario_table$target_id[[i]]
+
+  scenario_numeric <- terra::ifel(
+    convertible_mask,
+    target_id,
+    current_landuse_numeric
+  )
+  scenario_raster <- scenario_numeric
+  names(scenario_raster) <- "Landuse"
+  terra::levels(scenario_raster) <- as.data.frame(
+    landuse_legend[c("id", "class")]
+  )
+
+  scenario_path <- file.path(
+    scenario_directory,
+    paste0("Landuse_Silkeborg_", scenario_name, ".tif")
+  )
+
+  write_landuse_raster(
+    scenario_raster,
+    filename = scenario_path,
+    overwrite = params$overwrite
+  )
+
+  changed <- scenario_numeric != current_landuse_numeric
+  changed_outside_convertible <- changed & !convertible_mask
+  remaining_convertible <- scenario_numeric %in% convertible_ids
+
+  scenario_results[[i]] <- tibble::tibble(
+    scenario = scenario_name,
+    target_id = target_id,
+    target_class = scenario_table$target_class[[i]],
+    changed_cells = count_true(changed),
+    expected_changed_cells = convertible_cells,
+    changed_area_km2 = sum_where(cell_area_km2, changed),
+    expected_changed_area_km2 = convertible_area_km2,
+    changed_outside_convertible_cells = count_true(
+      changed_outside_convertible
+    ),
+    remaining_convertible_cells = count_true(remaining_convertible),
+    geometry_matches_current = terra::compareGeom(
+      scenario_raster,
+      current_landuse_numeric,
+      stopOnError = FALSE
+    ),
+    landuse_path = scenario_path
+  )
+}
+
+scenario_audit <- dplyr::bind_rows(scenario_results)
+
+if (any(
+  scenario_audit$changed_cells != scenario_audit$expected_changed_cells |
+    scenario_audit$changed_outside_convertible_cells != 0L |
+    scenario_audit$remaining_convertible_cells != 0L |
+    !scenario_audit$geometry_matches_current
+)) {
+  stop("At least one land-use scenario failed its audit.", call. = FALSE)
+}
+
+area_tolerance <- max(1e-8, convertible_area_km2 * 1e-10)
+if (any(abs(
+  scenario_audit$changed_area_km2 -
+    scenario_audit$expected_changed_area_km2
+) > area_tolerance)) {
+  stop("At least one scenario changed the wrong area.", call. = FALSE)
+}
+
+knitr::kable(
+  scenario_audit |>
+    dplyr::select(
+      .data$scenario,
+      .data$target_class,
+      .data$changed_cells,
+      .data$changed_area_km2,
+      .data$changed_outside_convertible_cells,
+      .data$remaining_convertible_cells
+    ),
+  digits = 3
+)
+```
+
+# Write SpeciesPoolR manifests
+
+The training manifest combines the new national land-use layer with the
+original national CHELSA stack. The projection manifest combines local current
+land use with local CHELSA. Every restoration scenario uses local current
+CHELSA. Later, a future-climate path can replace the second element of any
+scenario's `path` vector without changing the land-use files.
+
+```{r write-manifests}
+training_current_predictor_paths <- c(
+  training_landuse_output_path,
+  current_climate_source
+)
+
+projection_current_predictor_paths <- c(
+  params$current_landuse_file,
+  climate_output_path
+)
+
+scenario_specs <- data.frame(
+  scenario = scenario_audit$scenario,
+  stringsAsFactors = FALSE
+)
+scenario_specs$path <- unname(lapply(
+  scenario_audit$landuse_path,
+  function(landuse_path) c(landuse_path, climate_output_path)
+))
+
+training_manifest_path <- file.path(
+  params$output_dir,
+  "training_current_predictor_paths_Denmark.rds"
+)
+projection_current_manifest_path <- file.path(
+  params$output_dir,
+  "projection_current_predictor_paths_silkeborg.rds"
+)
+scenario_manifest_path <- file.path(
+  params$output_dir,
+  "mixed_scenario_specs_silkeborg.rds"
+)
+scenario_audit_path <- file.path(
+  params$output_dir,
+  "landuse_scenario_audit.csv"
+)
+scenario_table_path <- file.path(
+  params$output_dir,
+  "landuse_scenario_table.csv"
+)
+
+saveRDS(training_current_predictor_paths, training_manifest_path)
+saveRDS(
+  projection_current_predictor_paths,
+  projection_current_manifest_path
+)
+saveRDS(scenario_specs, scenario_manifest_path)
+readr::write_csv(scenario_audit, scenario_audit_path)
+readr::write_csv(scenario_table, scenario_table_path)
+
+c(
+  training_manifest = training_manifest_path,
+  projection_current_manifest = projection_current_manifest_path,
+  scenario_manifest = scenario_manifest_path,
+  scenario_audit = scenario_audit_path,
+  scenario_table = scenario_table_path,
+  climate = climate_output_path
+)
+```
+
+# Final checks
+
+```{r final-checks}
+stopifnot(
+  length(training_current_predictor_paths) == 2L,
+  all(file.exists(training_current_predictor_paths)),
+  length(projection_current_predictor_paths) == 2L,
+  all(file.exists(projection_current_predictor_paths)),
+  nrow(scenario_specs) == 8L,
+  all(vapply(scenario_specs$path, length, integer(1)) == 2L),
+  all(file.exists(unlist(scenario_specs$path, use.names = FALSE)))
+)
+
+manifest_audit <- tibble::tibble(
+  training_predictor_files = length(training_current_predictor_paths),
+  projection_current_predictor_files = length(
+    projection_current_predictor_paths
+  ),
+  scenarios = nrow(scenario_specs),
+  convertible_cells = convertible_cells,
+  convertible_area_km2 = convertible_area_km2,
+  climate_layers = terra::nlyr(current_climate),
+  complete_climate_cells = as.numeric(finite_climate_cells)
+)
+
+knitr::kable(manifest_audit, digits = 3)
+```
+
+# Use in the targets pipeline
+
+The existing climate pipeline uses one `Current_predictors` object for both
+model fitting and current projection. For this experiment it should be split:
+
+- `Training_current_predictors`: national land use + national current CHELSA;
+- `Projection_current_predictors`: Silkeborg land use + Silkeborg current
+  CHELSA; and
+- `Scenario_predictors`: the eight local scenario pairs.
+
+Point new file targets to the manifests:
+
+```r
+targets::tar_target(
+  Study_area_file,
+  "Datasets/Silkeborg_kommune.shp",
+  format = "file"
+)
+
+targets::tar_target(
+  Training_predictor_manifest_file,
+  "Predictors/silkeborg_scenarios/training_current_predictor_paths_Denmark.rds",
+  format = "file"
+)
+
+targets::tar_target(
+  Projection_current_predictor_manifest_file,
+  "Predictors/silkeborg_scenarios/projection_current_predictor_paths_silkeborg.rds",
+  format = "file"
+)
+
+targets::tar_target(
+  Scenario_manifest_file,
+  "Predictors/silkeborg_scenarios/mixed_scenario_specs_silkeborg.rds",
+  format = "file"
+)
+```
+
+Use `Training_current_predictors` in `FitSpeciesModels()`. Thresholds must also
+be calibrated from national current predictions (or from an equivalent,
+validated occurrence-level calculation) before those thresholds are applied to
+the local current and scenario projections. This requires a small pipeline
+refactor; simply pointing the old `Current_predictor_manifest_file` at the local
+manifest would silently discard most occurrence records.
+
+Keep `categorical = "Landuse"`. Start the server run with 20--30 crew workers,
+one `terra`/BLAS thread per worker, and increase only after observing RAM, disk
+throughput and worker recycling. With the domain restricted to Silkeborg, disk
+I/O is likely to become limiting before the available terabyte of RAM.
+
+# Plot current and one scenario
+
+```{r plot, fig.width=11, fig.height=6}
+example_scenario <- terra::rast(scenario_audit$landuse_path[[1]])
+
+plot(
+  c(current_landuse, example_scenario),
+  type = "classes",
+  main = c("Current", scenario_audit$scenario[[1]])
+)
+```
