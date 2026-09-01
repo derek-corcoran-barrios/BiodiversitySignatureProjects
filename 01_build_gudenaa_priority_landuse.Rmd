@@ -467,13 +467,13 @@ landuse <- terra::cover(nature_layer, landuse)
 names(landuse) <- "Landuse"
 
 class_table <- as.data.frame(landuse_legend[c("id", "class")])
-terra::levels(landuse) <- class_table
+levels(landuse) <- class_table
 
 landuse_gudenaa <- landuse |>
   terra::crop(gudenaa, snap = "out") |>
   terra::mask(gudenaa)
 names(landuse_gudenaa) <- "Landuse"
-terra::levels(landuse_gudenaa) <- class_table
+(landuse_gudenaa) <- class_table
 ```
 
 # Validation and the production-forest check
