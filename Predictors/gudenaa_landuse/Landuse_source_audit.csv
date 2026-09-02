@@ -1,0 +1,9 @@
+measure,cells
+all_basemap_forest_cells,56240543
+subclasses_drevet_skov_cells,5411699
+basemap_forest_outside_subclasses_cells,45557903
+final_production_forest_cells,52206049
+final_agriculture_cells,251040193
+final_urban_cells,56413271
+final_nature_cells,40541384
+basemap_urban_final_agriculture_cells,2798192

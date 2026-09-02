@@ -1,0 +1,13 @@
+id,class,role
+1,ForestDryPoor,nature
+2,ForestWetPoor,nature
+3,ForestDryRich,nature
+4,ForestWetRich,nature
+5,OpenDryPoor,nature
+6,OpenWetPoor,nature
+7,OpenDryRich,nature
+8,OpenWetRich,nature
+9,Agriculture,convertible
+10,Urban,fixed
+11,ProductionForest,convertible
+12,Other,fixed

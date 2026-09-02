@@ -1,0 +1,13 @@
+id,class,role,area_km2
+1,ForestDryPoor,nature,20.450005536171375
+2,ForestWetPoor,nature,5.602611711423378
+3,ForestDryRich,nature,2.1872262917240732
+4,ForestWetRich,nature,4.528615831266507
+5,OpenDryPoor,nature,111.94080246818339
+6,OpenWetPoor,nature,11.621659944888961
+7,OpenDryRich,nature,27.17328053592064
+8,OpenWetRich,nature,294.5790431908317
+9,Agriculture,convertible,3735.088328700491
+10,Urban,fixed,910.5337964385399
+11,ProductionForest,convertible,1070.9684212979191
+12,Other,fixed,410.67608742939046

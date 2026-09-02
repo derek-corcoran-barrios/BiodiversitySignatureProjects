@@ -1,31 +1,31 @@
 ---
-title: "Build eight Silkeborg nature-restoration scenarios"
+title: "Build eight gudenaa nature-restoration scenarios"
 output:
   html_document:
     toc: true
     toc_float: true
     number_sections: true
 params:
-  national_current_landuse_file: "Predictors/silkeborg_landuse/Landuse_Denmark_current.tif"
-  current_landuse_file: "Predictors/silkeborg_landuse/Landuse_Silkeborg_current.tif"
-  landuse_legend_file: "Predictors/silkeborg_landuse/Landuse_class_legend.csv"
-  silkeborg_file: "Datasets/Silkeborg_kommune.shp"
+  national_current_landuse_file: "Predictors/gudenaa_landuse/Landuse_Denmark_current.tif"
+  current_landuse_file: "Predictors/gudenaa_landuse/Landuse_gudenaa_current.tif"
+  landuse_legend_file: "Predictors/gudenaa_landuse/Landuse_class_legend.csv"
+  gudenaa_file: "Datasets/greater_area_gudenaaen.shp"
   current_climate_file: ""
   current_predictor_manifest_file: "Predictors/current_predictor_paths.rds"
-  output_dir: "Predictors/silkeborg_scenarios"
+  output_dir: "Predictors/gudenaa_scenarios"
   overwrite: false
 ---
 
 # Purpose
 
 This workflow starts from the priority land-use raster created by
-`01_build_silkeborg_priority_landuse.Rmd`. It creates eight counterfactual
+`01_build_gudenaa_priority_landuse.Rmd`. It creates eight counterfactual
 rasters. In each one, **every Agriculture and ProductionForest cell** is changed
 to one of the eight nature types.
 
 Existing nature, urban and other cells remain unchanged. The workflow also:
 
-- aligns the existing current CHELSA stack to the Silkeborg 10 m template;
+- aligns the existing current CHELSA stack to the gudenaa 10 m template;
 - writes separate national-training and local-projection manifests;
 - writes a scenario manifest in the list-column format used by
   `SpeciesPoolR::load_one_scenario()`; and
@@ -40,8 +40,8 @@ land use and national CHELSA so Danish occurrence records remain inside the
 predictor domain. The national 10 m land-use raster is reduced to the existing
 CHELSA grid with nearest-neighbour resampling; CHELSA is not needlessly
 upsampled across all Denmark. Only current/scenario projections are restricted
-to Silkeborg. Do not replace the training predictors with the local manifest
-unless the scientific intention is to fit from Silkeborg records alone.
+to gudenaa. Do not replace the training predictors with the local manifest
+unless the scientific intention is to fit from gudenaa records alone.
 
 ```{r setup}
 knitr::opts_chunk$set(
@@ -206,7 +206,7 @@ assert_files_exist(c(
   params$national_current_landuse_file,
   params$current_landuse_file,
   params$landuse_legend_file,
-  params$silkeborg_file
+  params$gudenaa_file
 ))
 
 landuse_legend <- readr::read_csv(
@@ -259,7 +259,7 @@ if (terra::nlyr(national_current_landuse) != 1L) {
 }
 names(national_current_landuse) <- "Landuse"
 
-silkeborg <- params$silkeborg_file |>
+gudenaa <- params$gudenaa_file |>
   terra::vect() |>
   terra::makeValid() |>
   terra::aggregate() |>
@@ -267,13 +267,13 @@ silkeborg <- params$silkeborg_file |>
 
 current_landuse_numeric <- terra::mask(
   current_landuse_numeric,
-  silkeborg
+  gudenaa
 )
 ```
 
 # Align current CHELSA to the small template
 
-Only the Silkeborg extent is resampled to 10 m. Climate is continuous, so
+Only the gudenaa extent is resampled to 10 m. Climate is continuous, so
 bilinear interpolation is used; land use is never bilinearly interpolated.
 
 ```{r align-climate}
@@ -288,7 +288,7 @@ dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
 
 climate_output_path <- file.path(
   params$output_dir,
-  "CHELSA_current_Silkeborg_10m.tif"
+  "CHELSA_current_gudenaa_10m.tif"
 )
 
 current_climate_source_raster <- terra::rast(current_climate_source)
@@ -332,7 +332,7 @@ if (!terra::compareGeom(
 # Use a separate temporary file so GDAL never needs to overwrite a raster that
 # is still open. This matters especially on Windows servers.
 climate_projected_path <- tempfile(
-  pattern = "CHELSA_current_Silkeborg_projected_",
+  pattern = "CHELSA_current_gudenaa_projected_",
   fileext = ".tif"
 )
 
@@ -452,7 +452,7 @@ for (i in seq_len(nrow(scenario_table))) {
 
   scenario_path <- file.path(
     scenario_directory,
-    paste0("Landuse_Silkeborg_", scenario_name, ".tif")
+    paste0("Landuse_gudenaa_", scenario_name, ".tif")
   )
 
   write_landuse_raster(
@@ -553,11 +553,11 @@ training_manifest_path <- file.path(
 )
 projection_current_manifest_path <- file.path(
   params$output_dir,
-  "projection_current_predictor_paths_silkeborg.rds"
+  "projection_current_predictor_paths_gudenaa.rds"
 )
 scenario_manifest_path <- file.path(
   params$output_dir,
-  "mixed_scenario_specs_silkeborg.rds"
+  "mixed_scenario_specs_gudenaa.rds"
 )
 scenario_audit_path <- file.path(
   params$output_dir,
@@ -621,7 +621,7 @@ The existing climate pipeline uses one `Current_predictors` object for both
 model fitting and current projection. For this experiment it should be split:
 
 - `Training_current_predictors`: national land use + national current CHELSA;
-- `Projection_current_predictors`: Silkeborg land use + Silkeborg current
+- `Projection_current_predictors`: gudenaa land use + gudenaa current
   CHELSA; and
 - `Scenario_predictors`: the eight local scenario pairs.
 
@@ -630,25 +630,25 @@ Point new file targets to the manifests:
 ```r
 targets::tar_target(
   Study_area_file,
-  "Datasets/Silkeborg_kommune.shp",
+  "Datasets/greater_area_gudenaaen.shp",
   format = "file"
 )
 
 targets::tar_target(
   Training_predictor_manifest_file,
-  "Predictors/silkeborg_scenarios/training_current_predictor_paths_Denmark.rds",
+  "Predictors/gudenaa_scenarios/training_current_predictor_paths_Denmark.rds",
   format = "file"
 )
 
 targets::tar_target(
   Projection_current_predictor_manifest_file,
-  "Predictors/silkeborg_scenarios/projection_current_predictor_paths_silkeborg.rds",
+  "Predictors/gudenaa_scenarios/projection_current_predictor_paths_gudenaa.rds",
   format = "file"
 )
 
 targets::tar_target(
   Scenario_manifest_file,
-  "Predictors/silkeborg_scenarios/mixed_scenario_specs_silkeborg.rds",
+  "Predictors/gudenaa_scenarios/mixed_scenario_specs_gudenaa.rds",
   format = "file"
 )
 ```
@@ -662,7 +662,7 @@ manifest would silently discard most occurrence records.
 
 Keep `categorical = "Landuse"`. Start the server run with 20--30 crew workers,
 one `terra`/BLAS thread per worker, and increase only after observing RAM, disk
-throughput and worker recycling. With the domain restricted to Silkeborg, disk
+throughput and worker recycling. With the domain restricted to gudenaa, disk
 I/O is likely to become limiting before the available terabyte of RAM.
 
 # Plot current and one scenario

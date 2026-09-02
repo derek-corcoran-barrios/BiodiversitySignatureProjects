@@ -1,5 +1,5 @@
 ---
-title: "Build priority land-use rasters for Denmark and gudenaa"
+title: "Build priority land-use rasters for Denmark and Gudenå"
 output:
   html_document:
     toc: true
@@ -14,7 +14,12 @@ params:
   markblokkort_field: "MB_TYPE"
   gudenaa_file: "Datasets/greater_area_gudenaaen.shp"
   output_dir: "Predictors/gudenaa_landuse"
+  intermediate_dir: "Intermediates/gudenaa_landuse"
+  checkpoint_revision: "v1"
+  input_fingerprint: "metadata"
+  run_checkpoint_smoke_test: true
   forest_nature_rule: "subclasses_skovnatur"
+  agriculture_numeric_codes: ""
   overwrite: false
 ---
 
@@ -33,7 +38,9 @@ The last point is deliberate. `Subclasses == "Drevet Skov"` only identifies
 managed forest inside the protection-scheme footprint. It is useful as an
 audit, but it cannot be the source for production forest across the whole
 country. Here, all Basemap forest (`311000` and `312000`) is treated as
-production forest unless it is explicitly retained as forest nature.
+production forest unless it is explicitly retained as forest nature. This is
+a **production-forest proxy**, not a verified national inventory of management
+status. The checkpoint update does not change that ecological assumption.
 
 It writes a national current raster for model fitting and threshold calibration,
 then crops that exact raster to gudenaa for current and scenario projections.
@@ -48,8 +55,11 @@ The priority order is:
 5. other land.
 
 Thus, a natural habitat is not overwritten merely because it intersects a
-Markblokkort polygon. Agriculture still takes priority over production forest,
-and urban land is never included in a restoration scenario.
+Markblokkort polygon. Agriculture still takes priority over production forest.
+The final `Urban` class is fixed in restoration scenarios. Because agriculture
+outranks urban here, overlapping Basemap urban/Markblokkort cells are reported
+in the audit; exclude the original urban footprint in the scenario document if
+that footprint must never be converted.
 
 # Input folder
 
@@ -66,7 +76,51 @@ Basemap value-attribute table supplied with `lu_01_2018.tif` is essential: its
 The categorical baseline is built nationally because model fitting should use
 the Danish occurrence records and a national predictor domain. Only the final
 projection copy is cropped to gudenaa. CHELSA is **not** upscaled nationally;
-the second document aligns climate at 10 m only for the small municipality.
+the second document aligns climate at 10 m only for the local projection area.
+
+# Restarting without rebuilding everything
+
+Heavy raster stages are saved as compressed GeoTIFFs under
+`Intermediates/gudenaa_landuse/`. Audit tables are saved as ordinary RDS files.
+**No `SpatRaster` external pointers are saved in RDS or knitr's chunk cache.**
+
+- Knit normally. Messages say `[build]` for a new stage and `[reuse]` for a
+  matching completed stage.
+- A tiny four-cell self-test checks category saving, reopening, checkpoint
+  reuse, input invalidation, failed-stage retry, and export reuse before any
+  national rasters are processed. Leave `run_checkpoint_smoke_test: true`.
+- If knitting stops, fix the error and knit again with the same parameters.
+  Completed stages are reused, including the national raster if a later local
+  crop, audit, export, or plot fails.
+- Checkpoints include the stage's code, relevant helper code, input signatures,
+  parameters, category dictionary where relevant, and upstream checkpoints.
+  Changing only `gudenaa_file` rebuilds the local crop and its audit, not the
+  national classification. Plot/title edits do not rebuild rasters.
+- Large input rasters are checked by path, size, and modification time by
+  default; small files (up to 10 MiB), including projection/category sidecars,
+  are also hashed. Set `input_fingerprint: "md5"` for full-file input checks,
+  at the cost of reading every large input on each knit. VRTs are rejected:
+  materialize them to GeoTIFF first so external VRT sources cannot change
+  unnoticed.
+- To deliberately rebuild everything, change `checkpoint_revision` from
+  `"v1"` to `"v2"`. Old checkpoints are retained; they are not automatically
+  deleted. Also change this revision after editing an untracked global/helper
+  that you add to the workflow.
+- `overwrite` controls **final published outputs**, not checkpoint reuse.
+  Matching outputs from this version are reused even with `overwrite: false`.
+  An older or changed output is protected: choose a new `output_dir`, or set
+  `overwrite: true` only if you intend to replace it.
+
+Each stage has a fingerprint subfolder and a `complete.rds` record, written
+only after its file has been written and reopened successfully. An interrupted
+stage without a valid completion record is rebuilt. Do not edit checkpoint
+files manually, run two knits into the same folders concurrently, or commit
+`Intermediates/`, source rasters, or generated predictor TIFFs to Git. Old or
+incomplete checkpoint files consume disk space until you intentionally remove
+them; keep plenty of space on the working drive.
+
+The first run of this version must build the checkpoints once. It cannot
+recover unsaved intermediates from an earlier terminated Knit process.
 
 # Data provenance and redistribution
 
@@ -85,11 +139,13 @@ knitr::opts_chunk$set(
   comment = "#>",
   error = FALSE,
   message = TRUE,
-  warning = TRUE
+  warning = TRUE,
+  cache = FALSE
 )
 
 required_packages <- c(
-  "terra", "foreign", "dplyr", "readr", "stringr", "tibble", "knitr"
+  "terra", "foreign", "dplyr", "readr", "stringr", "tibble", "knitr",
+  "digest"
 )
 
 missing_packages <- setdiff(
@@ -109,6 +165,12 @@ library(terra)
 library(dplyr)
 
 terra::terraOptions(progress = 1L, threads = 1L)
+
+if (!params$input_fingerprint %in% c("metadata", "md5")) {
+  stop("`input_fingerprint` must be 'metadata' or 'md5'.", call. = FALSE)
+}
+dir.create(params$intermediate_dir, recursive = TRUE, showWarnings = FALSE)
+checkpoint_records <- new.env(parent = emptyenv())
 ```
 
 # Fixed class dictionary
@@ -164,9 +226,29 @@ assert_files_exist <- function(paths) {
   invisible(paths)
 }
 
-align_categorical <- function(x, template) {
-  x <- terra::crop(x, terra::ext(template), snap = "out")
+prepare_boundary <- function(path, target_crs) {
+  boundary <- terra::vect(path)
+  if (!nzchar(terra::crs(boundary))) {
+    stop(
+      "The Gudenå boundary has no CRS. Its .prj must have exactly the ",
+      "same basename as the .shp; do not guess the CRS from coordinates.",
+      call. = FALSE
+    )
+  }
+  boundary <- terra::makeValid(boundary)
+  boundary <- terra::aggregate(boundary)
+  terra::project(boundary, target_crs)
+}
 
+align_categorical <- function(x, template) {
+  stopifnot(
+    terra::nlyr(x) == 1L,
+    nzchar(terra::crs(x)),
+    nzchar(terra::crs(template))
+  )
+
+  # The destination grid supplies the extent. Do not crop with coordinates
+  # from another CRS before transforming the source.
   if (!terra::compareGeom(x, template, stopOnError = FALSE)) {
     x <- terra::project(x, template, method = "near")
   }
@@ -188,30 +270,11 @@ count_true <- function(x) {
   )
 }
 
-write_landuse_raster <- function(x, filename, overwrite = FALSE) {
-  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
-
-  terra::writeRaster(
-    x,
-    filename = filename,
-    overwrite = overwrite,
-    datatype = "INT1U",
-    NAflag = 255,
-    gdal = c(
-      "COMPRESS=DEFLATE",
-      "PREDICTOR=2",
-      "TILED=YES",
-      "BIGTIFF=IF_SAFER"
-    )
-  )
-
-  filename
-}
-
 read_agriculture_mask <- function(
     path,
     template,
     field = "MB_TYPE",
+    numeric_codes = NULL,
     accepted = c("OMD", "PGR", "ING", "PAF", "MIX", "VKS", "INT_AGG")) {
   raster_extensions <- c(".tif", ".tiff", ".vrt", ".img")
   extension <- tolower(tools::file_ext(path))
@@ -225,13 +288,36 @@ read_agriculture_mask <- function(
       NULL
     }
 
-    if (!is.null(category_table) && ncol(category_table) >= 2L) {
+    if (is.data.frame(category_table) && ncol(category_table) >= 2L) {
+      if (!any(as.character(category_table[[2]]) %in% accepted)) {
+        stop("Markblokkort has no recognised agriculture labels.", call. = FALSE)
+      }
       return(agriculture %in% accepted)
     }
 
-    # Numeric Markblokkort rasters are commonly 1/NA or 1/0. Zero is treated
-    # as background; any other finite value is agricultural land.
-    return(!is.na(agriculture) & agriculture != 0)
+    # YAML uses a simple string, e.g. "1" or "0,1", only when the user has
+    # verified the numeric code dictionary for an unlabelled raster.
+    if (is.character(numeric_codes)) {
+      if (length(numeric_codes) != 1L) {
+        stop("Supply numeric agriculture codes as one comma-separated string.")
+      }
+      numeric_codes <- if (!nzchar(trimws(numeric_codes))) {
+        NULL
+      } else {
+        suppressWarnings(as.numeric(strsplit(numeric_codes, ",", fixed = TRUE)[[1]]))
+      }
+    }
+    if (is.null(numeric_codes) || !length(numeric_codes) ||
+        !is.numeric(numeric_codes) || any(!is.finite(numeric_codes))) {
+      stop(
+        "Markblokkort category labels are missing. Set ",
+        "`agriculture_numeric_codes` to verified agricultural IDs ",
+        "(for example '1' only for a verified 1/0 or 1/NA mask). ",
+        "Code 0 may be a real class; it is not guessed to be background.",
+        call. = FALSE
+      )
+    }
+    return(agriculture %in% numeric_codes)
   }
 
   agriculture <- terra::vect(path)
@@ -242,7 +328,8 @@ read_agriculture_mask <- function(
     )
   }
 
-  agriculture <- agriculture[agriculture[[field]] %in% accepted, ]
+  stopifnot(nzchar(terra::crs(agriculture)))
+  agriculture <- agriculture[as.data.frame(agriculture)[[field]] %in% accepted, ]
   if (nrow(agriculture) == 0L) {
     stop("No accepted Markblokkort polygons were found.", call. = FALSE)
   }
@@ -252,7 +339,301 @@ read_agriculture_mask <- function(
 }
 ```
 
+# Durable checkpoints
+
+These helpers manage only their own output files. A new/changed stage writes a
+new file, so a failed attempt does not overwrite a previous completed raster.
+The metadata files contain paths, fingerprints and category tables, not live
+terra objects.
+
+```{r checkpoint-helpers}
+file_stamp <- function(paths) {
+  if (!length(paths) || any(!file.exists(paths))) return(NULL)
+  info <- file.info(paths)
+  if (any(is.na(info$size)) || any(info$isdir)) return(NULL)
+  data.frame(
+    path = normalizePath(paths, winslash = "/", mustWork = TRUE),
+    bytes = as.numeric(info$size),
+    modified = as.numeric(info$mtime),
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+}
+
+input_signature <- function(path) {
+  assert_files_exist(path)
+  if (tolower(tools::file_ext(path)) == "vrt") {
+    stop("Materialize VRT inputs to GeoTIFF before checkpointing.", call. = FALSE)
+  }
+  stem <- tools::file_path_sans_ext(path)
+  sidecars <- c(
+    paste0(path, c(".aux.xml", ".vat.dbf", ".ovr", ".xml")),
+    paste0(stem, c(".prj", ".PRJ", ".tfw", ".TFW", ".wld", ".ige"))
+  )
+  if (tolower(tools::file_ext(path)) == "shp") {
+    sidecars <- c(sidecars, paste0(stem, c(
+      ".dbf", ".shx", ".cpg", ".qix", ".sbn", ".sbx",
+      ".DBF", ".SHX", ".CPG"
+    )))
+  }
+  paths <- sort(unique(c(path, sidecars[file.exists(sidecars)])))
+  stamp <- file_stamp(paths)
+  if (is.null(stamp)) stop("Cannot fingerprint input: ", path, call. = FALSE)
+  hash_files <- params$input_fingerprint == "md5" | stamp$bytes <= 10 * 1024^2
+  stamp$md5 <- NA_character_
+  if (any(hash_files)) {
+    stamp$md5[hash_files] <- unname(tools::md5sum(stamp$path[hash_files]))
+    if (anyNA(stamp$md5[hash_files])) {
+      stop("Cannot hash an input file for: ", path, call. = FALSE)
+    }
+  }
+  stamp
+}
+
+checkpoint_ref <- function(name) {
+  record <- get(name, envir = checkpoint_records, inherits = FALSE)
+  list(key = record$key, files = record$files)
+}
+
+checkpoint_stage <- function(
+    name, inputs, build, kind = c("raster", "rds"),
+    helpers = list(), datatype = "INT1U",
+    category_table = NULL, layer_name = NULL) {
+  kind <- match.arg(kind)
+  stopifnot(length(name) == 1L, grepl("^[A-Za-z0-9_]+$", name))
+  # Hash code text, not source-reference attributes or closure environments:
+  # temporary knit filenames and changed report line numbers are not inputs.
+  function_code <- function(f) list(
+    formals = paste(deparse(formals(f), width.cutoff = 500L,
+                           control = c("keepInteger", "keepNA")), collapse = "\n"),
+    body = paste(deparse(body(f), width.cutoff = 500L,
+                        control = c("keepInteger", "keepNA")), collapse = "\n")
+  )
+  key <- digest::digest(list(
+    schema = 1L,
+    revision = params$checkpoint_revision,
+    terra = as.character(utils::packageVersion("terra")),
+    kind = kind, datatype = datatype,
+    categories = category_table, layer_name = layer_name,
+    inputs = inputs,
+    recipe = function_code(build),
+    helpers = lapply(helpers, function_code)
+  ), algo = "xxhash64")
+  stage_dir <- file.path(params$intermediate_dir, name, key)
+  marker_path <- file.path(stage_dir, "complete.rds")
+  record <- if (file.exists(marker_path)) {
+    tryCatch(readRDS(marker_path), error = function(e) NULL)
+  } else NULL
+
+  restore <- function(record) {
+    if (identical(record$kind, "rds")) return(readRDS(record$path))
+    x <- terra::rast(record$path)
+    if (terra::nlyr(x) != 1L) stop("Invalid checkpoint layer count.")
+    names(x) <- record$layer_names
+    if (is.data.frame(record$category_table) &&
+        ncol(record$category_table) >= 2L) {
+      levels(x) <- record$category_table
+    }
+    x
+  }
+
+  if (is.list(record) && identical(record$key, key) &&
+      is.data.frame(record$files) && nrow(record$files) > 0L &&
+      identical(file_stamp(record$files$path), record$files)) {
+    cached <- tryCatch(restore(record), error = function(e) NULL)
+    if (!is.null(cached)) {
+      assign(name, record, envir = checkpoint_records)
+      message("[reuse] ", name)
+      return(cached)
+    }
+  }
+
+  message("[build] ", name)
+  dir.create(stage_dir, recursive = TRUE, showWarnings = FALSE)
+  artifact_path <- tempfile(
+    pattern = paste0(name, "_"), tmpdir = stage_dir,
+    fileext = if (kind == "raster") ".tif" else ".rds"
+  )
+  value <- build()
+  record <- list(key = key, kind = kind)
+  if (kind == "raster") {
+    stopifnot(inherits(value, "SpatRaster"), terra::nlyr(value) == 1L)
+    if (!is.null(layer_name)) names(value) <- layer_name
+    if (!is.null(category_table)) levels(value) <- category_table
+    record$layer_names <- names(value)
+    category_tables <- terra::levels(value)
+    record$category_table <- if (length(category_tables)) {
+      category_tables[[1]]
+    } else NULL
+    wopt <- list(
+      datatype = datatype,
+      gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER")
+    )
+    if (datatype == "INT1U") wopt$NAflag <- 255
+    terra::writeRaster(value, filename = artifact_path, overwrite = FALSE,
+                       wopt = wopt)
+  } else {
+    saveRDS(value, artifact_path)
+  }
+  record$path <- normalizePath(artifact_path, winslash = "/", mustWork = TRUE)
+  # These are the sidecars generated/used by our GeoTIFF checkpoints.
+  sidecars <- paste0(record$path, c(".aux.xml", ".vat.dbf", ".ovr"))
+  record$files <- file_stamp(c(record$path, sidecars[file.exists(sidecars)]))
+  if (is.null(record$files)) stop("Checkpoint write failed for ", name)
+  result <- restore(record)
+  record$completed_at <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+  # Written last: an interrupted/truncated marker is never a cache hit.
+  saveRDS(record, marker_path)
+  assign(name, record, envir = checkpoint_records)
+  message("[saved] ", name)
+  result
+}
+
+publish_checkpoint <- function(name, filename, overwrite = FALSE) {
+  record <- get(name, envir = checkpoint_records, inherits = FALSE)
+  stopifnot(identical(record$kind, "raster"))
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  marker <- paste0(filename, ".checkpoint.rds")
+  previous <- if (file.exists(marker)) {
+    tryCatch(readRDS(marker), error = function(e) NULL)
+  } else NULL
+  reference <- checkpoint_ref(name)
+  same_source <- is.list(previous) && identical(previous$source, reference)
+  if (same_source && identical(previous$state, "complete") &&
+      is.data.frame(previous$files) &&
+      identical(file_stamp(previous$files$path), previous$files)) {
+    message("[reuse output] ", filename)
+    return(filename)
+  }
+  # Copy the compressed TIFF plus its category sidecars, rather than
+  # decompressing and recompressing the national raster a second time.
+  suffix <- substring(record$files$path, nchar(record$path) + 1L)
+  destinations <- paste0(filename, suffix)
+  known_sidecars <- paste0(filename, c(".aux.xml", ".vat.dbf", ".ovr"))
+  existing <- unique(c(destinations, known_sidecars))
+  continuing_own_copy <- same_source && identical(previous$state, "writing")
+  if (any(file.exists(existing)) && !isTRUE(overwrite) && !continuing_own_copy) {
+    stop(
+      "Existing output has no matching completed checkpoint: ", filename,
+      ". Choose a new output_dir, or set overwrite: true if replacement ",
+      "is intended. All completed intermediates remain available.",
+      call. = FALSE
+    )
+  }
+  saveRDS(list(source = reference, state = "writing"), marker)
+  # Only obsolete sidecars for this explicitly permitted output are removed.
+  obsolete <- setdiff(known_sidecars, destinations)
+  obsolete <- obsolete[file.exists(obsolete)]
+  if (length(obsolete) && any(unlink(obsolete) != 0L)) {
+    stop("Could not remove obsolete sidecars for ", filename, call. = FALSE)
+  }
+  copied <- file.copy(record$files$path, destinations, overwrite = TRUE)
+  if (!all(copied)) stop("Could not finish copying output: ", filename)
+  output_files <- file_stamp(destinations)
+  if (is.null(output_files) ||
+      !identical(output_files$bytes, record$files$bytes)) {
+    stop("Output copy has an unexpected size: ", filename, call. = FALSE)
+  }
+  terra::rast(filename) # Confirm that the published TIFF can be opened.
+  saveRDS(list(source = reference, state = "complete", files = output_files), marker)
+  message("[published] ", filename)
+  filename
+}
+```
+
 # Validate and read inputs
+
+```{r checkpoint-smoke-test, echo=FALSE, message=FALSE}
+if (isTRUE(params$run_checkpoint_smoke_test)) {
+  local({
+    test_dir <- tempfile("gudenaa_checkpoint_test_")
+    dir.create(test_dir)
+    # Give the helpers an isolated folder/registry; production checkpoints
+    # and parameters are not modified by this test.
+    test_env <- new.env(parent = environment(checkpoint_stage))
+    test_env$params <- utils::modifyList(params, list(intermediate_dir = test_dir))
+    test_env$checkpoint_records <- new.env(parent = emptyenv())
+    for (helper in c("file_stamp", "checkpoint_ref", "checkpoint_stage",
+                     "publish_checkpoint")) {
+      f <- get(helper, envir = environment(checkpoint_stage))
+      environment(f) <- test_env
+      assign(helper, f, envir = test_env)
+    }
+    builds <- 0L
+    build_test_raster <- function() {
+      builds <<- builds + 1L
+      x <- terra::rast(nrows = 2, ncols = 2, xmin = 0, xmax = 2,
+                       ymin = 0, ymax = 2, crs = "EPSG:25832")
+      values(x) <- c(1, 9, 11, NA_real_)
+      x
+    }
+    test_categories <- as.data.frame(landuse_legend[c("id", "class")])
+    first <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 1L), build = build_test_raster,
+      category_table = test_categories
+    )
+    first_path <- terra::sources(first)
+    # Reset the in-memory registry: the hit must come from files on disk.
+    test_env$checkpoint_records <- new.env(parent = emptyenv())
+    second <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 1L), build = build_test_raster,
+      category_table = test_categories
+    )
+    # terra/GDAL may read a missing cell as NaN rather than R's NA_real_.
+    # Test the missing-cell mask separately, then require exact category IDs.
+    expected_values <- c(1, 9, 11, NA_real_)
+    actual_values <- as.numeric(terra::values(second))
+    observed <- !is.na(expected_values)
+    values_ok <-
+      length(actual_values) == length(expected_values) &&
+      identical(is.na(actual_values), is.na(expected_values)) &&
+      identical(actual_values[observed], expected_values[observed])
+    if (!values_ok) {
+      stop(
+        "Checkpoint read-back values differ. Expected: ",
+        paste(expected_values, collapse = ", "),
+        "; read back: ", paste(actual_values, collapse = ", "),
+        ". Do not disable the self-test; inspect this mismatch first.",
+        call. = FALSE
+      )
+    }
+    stopifnot(
+      builds == 1L, identical(first_path, terra::sources(second)),
+      identical(as.character(levels(second)[[1]][[2]]), test_categories$class)
+    )
+    published <- file.path(test_dir, "published.tif")
+    test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+    test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+    third <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 2L), build = build_test_raster,
+      category_table = test_categories
+    )
+    stopifnot(builds == 2L, !identical(first_path, terra::sources(third)))
+    protected <- tryCatch({
+      test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+      FALSE
+    }, error = function(e) TRUE)
+    stopifnot(protected)
+    fail_once <- TRUE
+    build_test_table <- function() {
+      if (fail_once) {
+        fail_once <<- FALSE
+        stop("Intentional smoke-test interruption.")
+      }
+      data.frame(ok = TRUE)
+    }
+    failed <- tryCatch({
+      test_env$checkpoint_stage("test_retry", list(), build_test_table, kind = "rds")
+      FALSE
+    }, error = function(e) TRUE)
+    table <- test_env$checkpoint_stage(
+      "test_retry", list(), build_test_table, kind = "rds"
+    )
+    stopifnot(failed, identical(table, data.frame(ok = TRUE)))
+  })
+  cat("Checkpoint self-test passed.\n")
+}
+```
 
 ```{r read-inputs}
 assert_files_exist(c(
@@ -269,14 +650,35 @@ if (terra::nlyr(basemap) != 1L) {
   stop("The Basemap input must contain exactly one layer.", call. = FALSE)
 }
 
-gudenaa <- terra::vect(params$gudenaa_file)
-gudenaa <- terra::makeValid(gudenaa)
-gudenaa <- terra::aggregate(gudenaa)
-gudenaa <- terra::project(gudenaa, terra::crs(basemap))
+stopifnot(nzchar(terra::crs(basemap)))
+gudenaa <- prepare_boundary(params$gudenaa_file, terra::crs(basemap))
 
 basemap_template <- basemap
 
 names(basemap_template) <- "Basemap_value"
+
+# Fingerprint each source once per knit. Boundary changes are used only by
+# local stages. Basemap category/CRS sidecars are included automatically.
+source_signatures <- lapply(list(
+  basemap = params$basemap_file,
+  subclasses = params$subclasses_file,
+  agriculture = params$markblokkort_file,
+  gudenaa = params$gudenaa_file
+), input_signature)
+
+subclasses_input <- terra::rast(params$subclasses_file)
+stopifnot(terra::nlyr(subclasses_input) == 1L,
+          nzchar(terra::crs(subclasses_input)))
+subclass_tables <- terra::levels(subclasses_input)
+subclass_table <- if (length(subclass_tables)) subclass_tables[[1]] else NULL
+if (!is.data.frame(subclass_table) || ncol(subclass_table) < 2L) {
+  stop("Subclasses must retain its category labels; numeric IDs are not guessed.",
+       call. = FALSE)
+}
+if (identical(params$forest_nature_rule, "subclasses_skovnatur") &&
+    !"Skovnatur" %in% as.character(subclass_table[[2]])) {
+  stop("The Subclasses category table does not contain 'Skovnatur'.", call. = FALSE)
+}
 
 vat <- foreign::read.dbf(params$basemap_vat_file, as.is = TRUE)
 reclass <- utils::read.csv(
@@ -318,8 +720,8 @@ Agriculture is taken from Markblokkort, not inferred from these codes.
 reclass_clean <- reclass |>
   dplyr::transmute(
     Value1 = as.numeric(.data$Value1),
-    SN_ModelClass = stringr::str_trim(
-      sub("Both$", "Rich", .data$SN_ModelClass)
+    SN_ModelClass = dplyr::na_if(
+      sub("Both$", "Rich", stringr::str_trim(.data$SN_ModelClass)), ""
     )
   )
 
@@ -376,20 +778,41 @@ if (nrow(nature_lookup) == 0L) {
   stop("No Basemap values mapped to the eight nature types.", call. = FALSE)
 }
 
-nature_candidate <- terra::classify(
-  basemap_template,
-  rcl = as.matrix(nature_lookup),
-  others = NA
+nature_candidate <- checkpoint_stage(
+  "01_nature_candidate",
+  inputs = list(basemap = source_signatures$basemap, lookup = nature_lookup),
+  build = function() {
+    terra::classify(basemap_template, rcl = as.matrix(nature_lookup), others = NA)
+  },
+  layer_name = "Nature_candidate"
 )
 
-subclasses <- params$subclasses_file |>
-  terra::rast() |>
-  align_categorical(basemap_template)
+subclasses <- checkpoint_stage(
+  "02_subclasses_aligned",
+  inputs = list(basemap = source_signatures$basemap,
+                subclasses = source_signatures$subclasses),
+  build = function() {
+    align_categorical(terra::rast(params$subclasses_file), basemap_template)
+  },
+  helpers = list(align_categorical),
+  datatype = "INT4S", layer_name = "Subclass"
+)
 
-agriculture_mask <- read_agriculture_mask(
-  path = params$markblokkort_file,
-  template = basemap_template,
-  field = params$markblokkort_field
+agriculture_mask <- checkpoint_stage(
+  "03_agriculture_mask",
+  inputs = list(basemap = source_signatures$basemap,
+                agriculture = source_signatures$agriculture,
+                field = params$markblokkort_field,
+                numeric_codes = params$agriculture_numeric_codes),
+  build = function() {
+    read_agriculture_mask(
+      path = params$markblokkort_file, template = basemap_template,
+      field = params$markblokkort_field,
+      numeric_codes = params$agriculture_numeric_codes
+    )
+  },
+  helpers = list(align_categorical, read_agriculture_mask),
+  layer_name = "Agriculture_mask"
 )
 
 forest_basemap_values <- rat |>
@@ -402,8 +825,18 @@ urban_basemap_values <- rat |>
   dplyr::pull(.data$Value) |>
   unique()
 
-forest_mask <- basemap_template %in% forest_basemap_values
-urban_mask <- basemap_template %in% urban_basemap_values
+forest_mask <- checkpoint_stage(
+  "04_forest_mask",
+  inputs = list(basemap = source_signatures$basemap, codes = forest_basemap_values),
+  build = function() basemap_template %in% forest_basemap_values,
+  layer_name = "Forest_mask"
+)
+urban_mask <- checkpoint_stage(
+  "05_urban_mask",
+  inputs = list(basemap = source_signatures$basemap, codes = urban_basemap_values),
+  build = function() basemap_template %in% urban_basemap_values,
+  layer_name = "Urban_mask"
+)
 
 open_codes <- landuse_legend$id[
   startsWith(landuse_legend$class, "Open")
@@ -412,24 +845,27 @@ forest_codes <- landuse_legend$id[
   startsWith(landuse_legend$class, "Forest")
 ]
 
-open_nature_mask <- nature_candidate %in% open_codes
-
-if (identical(params$forest_nature_rule, "subclasses_skovnatur")) {
-  forest_nature_mask <-
-    nature_candidate %in% forest_codes &
-    subclasses %in% "Skovnatur"
-} else if (identical(params$forest_nature_rule, "all_sn_forest")) {
-  forest_nature_mask <- nature_candidate %in% forest_codes
-} else {
-  stop(
-    "`forest_nature_rule` must be `subclasses_skovnatur` or ",
-    "`all_sn_forest`.",
-    call. = FALSE
-  )
-}
-
-nature_mask <- open_nature_mask | forest_nature_mask
-nature_layer <- terra::ifel(nature_mask, nature_candidate, NA)
+nature_layer <- checkpoint_stage(
+  "06_nature_layer",
+  inputs = list(candidate = checkpoint_ref("01_nature_candidate"),
+                subclasses = checkpoint_ref("02_subclasses_aligned"),
+                rule = params$forest_nature_rule,
+                open_codes = open_codes, forest_codes = forest_codes),
+  build = function() {
+    open_nature_mask <- nature_candidate %in% open_codes
+    if (identical(params$forest_nature_rule, "subclasses_skovnatur")) {
+      forest_nature_mask <- nature_candidate %in% forest_codes &
+        subclasses %in% "Skovnatur"
+    } else if (identical(params$forest_nature_rule, "all_sn_forest")) {
+      forest_nature_mask <- nature_candidate %in% forest_codes
+    } else {
+      stop("Unknown forest_nature_rule.", call. = FALSE)
+    }
+    nature_mask <- open_nature_mask | forest_nature_mask
+    terra::ifel(!is.na(nature_mask) & nature_mask, nature_candidate, NA)
+  },
+  layer_name = "Nature_layer"
+)
 ```
 
 # Apply the priority hierarchy
@@ -440,6 +876,7 @@ the eight nature classes on top.
 ```{r priority-landuse}
 denmark_domain_values <- rat |>
   dplyr::filter(
+    !is.na(.data$C_19),
     !.data$C_19 %in% c(
       420000L, # sea
       800000L, # unmapped
@@ -449,31 +886,51 @@ denmark_domain_values <- rat |>
   dplyr::pull(.data$Value) |>
   unique()
 
-domain <- basemap_template %in% denmark_domain_values
-
-landuse <- terra::ifel(domain, code_for("Other"), NA)
-landuse <- terra::ifel(
-  forest_mask,
-  code_for("ProductionForest"),
-  landuse
-)
-landuse <- terra::ifel(urban_mask, code_for("Urban"), landuse)
-landuse <- terra::ifel(
-  agriculture_mask,
-  code_for("Agriculture"),
-  landuse
-)
-landuse <- terra::cover(nature_layer, landuse)
-names(landuse) <- "Landuse"
-
 class_table <- as.data.frame(landuse_legend[c("id", "class")])
-levels(landuse) <- class_table
+domain <- checkpoint_stage(
+  "07_denmark_domain",
+  inputs = list(basemap = source_signatures$basemap, codes = denmark_domain_values),
+  build = function() basemap_template %in% denmark_domain_values,
+  layer_name = "Denmark_domain"
+)
 
-landuse_gudenaa <- landuse |>
-  terra::crop(gudenaa, snap = "out") |>
-  terra::mask(gudenaa)
-names(landuse_gudenaa) <- "Landuse"
-(landuse_gudenaa) <- class_table
+landuse <- checkpoint_stage(
+  "08_landuse_denmark",
+  inputs = list(
+    domain = checkpoint_ref("07_denmark_domain"),
+    forest = checkpoint_ref("04_forest_mask"),
+    urban = checkpoint_ref("05_urban_mask"),
+    agriculture = checkpoint_ref("03_agriculture_mask"),
+    nature = checkpoint_ref("06_nature_layer"),
+    legend = landuse_legend
+  ),
+  build = function() {
+    out <- terra::ifel(domain, code_for("Other"), NA)
+    out <- terra::ifel(!is.na(forest_mask) & forest_mask,
+                       code_for("ProductionForest"), out)
+    out <- terra::ifel(!is.na(urban_mask) & urban_mask, code_for("Urban"), out)
+    out <- terra::ifel(!is.na(agriculture_mask) & agriculture_mask,
+                       code_for("Agriculture"), out)
+    out <- terra::cover(nature_layer, out)
+    # Reapply the domain after overlays so no source can restore excluded cells.
+    terra::ifel(domain, out, NA)
+  },
+  helpers = list(code_for),
+  category_table = class_table, layer_name = "Landuse"
+)
+
+landuse_gudenaa <- checkpoint_stage(
+  "09_landuse_gudenaa",
+  inputs = list(national = checkpoint_ref("08_landuse_denmark"),
+                boundary = source_signatures$gudenaa),
+  build = function() {
+    landuse |>
+      terra::crop(gudenaa, snap = "out") |>
+      terra::mask(gudenaa)
+  },
+  helpers = list(prepare_boundary),
+  category_table = class_table, layer_name = "Landuse"
+)
 ```
 
 # Validation and the production-forest check
@@ -483,37 +940,82 @@ from `Subclasses == "Drevet Skov"` and how much is found from Basemap. A large
 difference is expected and is the reason for the revised method.
 
 ```{r validate}
-if (!terra::compareGeom(landuse, basemap_template, stopOnError = FALSE)) {
-  stop("The final land-use raster lost the Basemap geometry.", call. = FALSE)
-}
+national_validation <- checkpoint_stage(
+  "10_denmark_validation", kind = "rds",
+  inputs = list(national = checkpoint_ref("08_landuse_denmark"),
+                domain = checkpoint_ref("07_denmark_domain"),
+                basemap = source_signatures$basemap, legend = landuse_legend),
+  build = function() {
+    if (!terra::compareGeom(landuse, basemap_template, stopOnError = FALSE)) {
+      stop("The final land-use raster lost the Basemap geometry.", call. = FALSE)
+    }
+    # Do not use value = TRUE: that would count only cells with ID 1.
+    observed_ids <- terra::freq(as.numeric(landuse))
+    stopifnot(
+      !is.null(observed_ids), nrow(observed_ids) > 0L,
+      all(observed_ids$value %in% landuse_legend$id)
+    )
+    holes <- count_true(domain & is.na(landuse))
+    outside <- count_true((is.na(domain) | !domain) & !is.na(landuse))
+    stopifnot(holes == 0, outside == 0)
+    data.frame(
+      national_class_ids_ok = TRUE,
+      national_cells = sum(observed_ids$count),
+      missing_cells_inside_domain = holes,
+      populated_cells_outside_domain = outside
+    )
+  },
+  helpers = list(count_true)
+)
 
-observed_ids <- terra::freq(as.numeric(landuse), value = TRUE)
-if (!all(observed_ids$value %in% landuse_legend$id)) {
-  stop("The final raster contains an unknown class ID.", call. = FALSE)
-}
+local_validation <- checkpoint_stage(
+  "10_gudenaa_validation", kind = "rds",
+  inputs = list(local = checkpoint_ref("09_landuse_gudenaa"),
+                legend = landuse_legend),
+  build = function() {
+    local_ids <- terra::freq(as.numeric(landuse_gudenaa))
+    stopifnot(
+      !is.null(local_ids), nrow(local_ids) > 0L,
+      all(local_ids$value %in% landuse_legend$id)
+    )
+    data.frame(local_class_ids_ok = TRUE, gudenaa_cells = sum(local_ids$count))
+  }
+)
+validation_audit <- cbind(national_validation, local_validation)
 
-subclasses_managed_forest <- subclasses %in% "Drevet Skov"
-forest_outside_subclasses <- forest_mask & is.na(subclasses)
-
-source_audit <- tibble::tibble(
-  measure = c(
-    "all_basemap_forest_cells",
-    "subclasses_drevet_skov_cells",
-    "basemap_forest_outside_subclasses_cells",
-    "final_production_forest_cells",
-    "final_agriculture_cells",
-    "final_urban_cells",
-    "final_nature_cells"
-  ),
-  cells = c(
-    count_true(forest_mask),
-    count_true(subclasses_managed_forest),
-    count_true(forest_outside_subclasses),
-    count_true(landuse == code_for("ProductionForest")),
-    count_true(landuse == code_for("Agriculture")),
-    count_true(landuse == code_for("Urban")),
-    count_true(landuse %in% landuse_legend$id[landuse_legend$role == "nature"])
-  )
+source_audit <- checkpoint_stage(
+  "11_source_audit", kind = "rds",
+  inputs = list(national = checkpoint_ref("08_landuse_denmark"),
+                subclasses = checkpoint_ref("02_subclasses_aligned"),
+                forest = checkpoint_ref("04_forest_mask"),
+                urban = checkpoint_ref("05_urban_mask"), legend = landuse_legend),
+  build = function() {
+    subclasses_managed_forest <- subclasses %in% "Drevet Skov"
+    forest_outside_subclasses <- forest_mask & is.na(subclasses)
+    tibble::tibble(
+      measure = c(
+        "all_basemap_forest_cells",
+        "subclasses_drevet_skov_cells",
+        "basemap_forest_outside_subclasses_cells",
+        "final_production_forest_cells",
+        "final_agriculture_cells",
+        "final_urban_cells",
+        "final_nature_cells",
+        "basemap_urban_final_agriculture_cells"
+      ),
+      cells = c(
+        count_true(forest_mask),
+        count_true(subclasses_managed_forest),
+        count_true(forest_outside_subclasses),
+        count_true(landuse == code_for("ProductionForest")),
+        count_true(landuse == code_for("Agriculture")),
+        count_true(landuse == code_for("Urban")),
+        count_true(landuse %in% landuse_legend$id[landuse_legend$role == "nature"]),
+        count_true(urban_mask & landuse == code_for("Agriculture"))
+      )
+    )
+  },
+  helpers = list(count_true, code_for)
 )
 
 if (source_audit$cells[source_audit$measure ==
@@ -525,35 +1027,39 @@ if (source_audit$cells[source_audit$measure ==
   )
 }
 
-cell_area_km2 <- terra::cellSize(landuse, unit = "km")
-area_by_class <- terra::zonal(
-  cell_area_km2,
-  as.numeric(landuse),
-  fun = "sum",
-  na.rm = TRUE
+class_audit <- checkpoint_stage(
+  "12_denmark_class_audit", kind = "rds",
+  inputs = list(national = checkpoint_ref("08_landuse_denmark"),
+                legend = landuse_legend),
+  build = function() {
+    cell_area_km2 <- terra::cellSize(landuse, unit = "km")
+    area_by_class <- terra::zonal(
+      cell_area_km2, as.numeric(landuse), fun = "sum", na.rm = TRUE
+    )
+    names(area_by_class) <- c("id", "area_km2")
+    landuse_legend |>
+      dplyr::left_join(area_by_class, by = "id") |>
+      dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
+  }
 )
-names(area_by_class) <- c("id", "area_km2")
 
-class_audit <- landuse_legend |>
-  dplyr::left_join(area_by_class, by = "id") |>
-  dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
-
-gudenaa_cell_area_km2 <- terra::cellSize(
-  landuse_gudenaa,
-  unit = "km"
+gudenaa_class_audit <- checkpoint_stage(
+  "13_gudenaa_class_audit", kind = "rds",
+  inputs = list(local = checkpoint_ref("09_landuse_gudenaa"),
+                legend = landuse_legend),
+  build = function() {
+    local_cell_area_km2 <- terra::cellSize(landuse_gudenaa, unit = "km")
+    local_area_by_class <- terra::zonal(
+      local_cell_area_km2, as.numeric(landuse_gudenaa), fun = "sum", na.rm = TRUE
+    )
+    names(local_area_by_class) <- c("id", "area_km2")
+    landuse_legend |>
+      dplyr::left_join(local_area_by_class, by = "id") |>
+      dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
+  }
 )
-gudenaa_area_by_class <- terra::zonal(
-  gudenaa_cell_area_km2,
-  as.numeric(landuse_gudenaa),
-  fun = "sum",
-  na.rm = TRUE
-)
-names(gudenaa_area_by_class) <- c("id", "area_km2")
 
-gudenaa_class_audit <- landuse_legend |>
-  dplyr::left_join(gudenaa_area_by_class, by = "id") |>
-  dplyr::mutate(area_km2 = dplyr::coalesce(.data$area_km2, 0))
-
+knitr::kable(validation_audit)
 knitr::kable(source_audit)
 knitr::kable(class_audit, digits = 3)
 knitr::kable(gudenaa_class_audit, digits = 3)
@@ -573,6 +1079,7 @@ gudenaa_landuse_path <- file.path(
   "Landuse_gudenaa_current.tif"
 )
 legend_path <- file.path(params$output_dir, "Landuse_class_legend.csv")
+validation_audit_path <- file.path(params$output_dir, "Landuse_validation_audit.csv")
 source_audit_path <- file.path(
   params$output_dir,
   "Landuse_source_audit.csv"
@@ -594,17 +1101,16 @@ gudenaa_path_manifest <- file.path(
   "landuse_gudenaa_current_path.rds"
 )
 
-write_landuse_raster(
-  landuse,
-  filename = national_landuse_path,
+publish_checkpoint(
+  "08_landuse_denmark", filename = national_landuse_path,
   overwrite = params$overwrite
 )
-write_landuse_raster(
-  landuse_gudenaa,
-  filename = gudenaa_landuse_path,
+publish_checkpoint(
+  "09_landuse_gudenaa", filename = gudenaa_landuse_path,
   overwrite = params$overwrite
 )
 readr::write_csv(landuse_legend, legend_path)
+readr::write_csv(validation_audit, validation_audit_path)
 readr::write_csv(source_audit, source_audit_path)
 readr::write_csv(class_audit, class_audit_path)
 readr::write_csv(gudenaa_class_audit, gudenaa_class_audit_path)
@@ -615,6 +1121,7 @@ c(
   national_landuse = national_landuse_path,
   gudenaa_landuse = gudenaa_landuse_path,
   legend = legend_path,
+  validation_audit = validation_audit_path,
   source_audit = source_audit_path,
   national_class_audit = class_audit_path,
   gudenaa_class_audit = gudenaa_class_audit_path,
@@ -623,22 +1130,44 @@ c(
 )
 ```
 
+# Checkpoint inventory
+
+These are the artifacts used by this knit. The RDS metadata alongside the
+TIFFs preserves category names even if a GIS does not read TIFF category
+sidecars. Keep the entire intermediate folder together.
+
+```{r checkpoint-inventory}
+checkpoint_inventory <- do.call(rbind, lapply(
+  sort(ls(checkpoint_records)),
+  function(name) {
+    record <- get(name, envir = checkpoint_records, inherits = FALSE)
+    data.frame(stage = name, kind = record$kind,
+               size_MB = round(sum(record$files$bytes) / 1024^2, 2),
+               file = record$path)
+  }
+))
+knitr::kable(checkpoint_inventory)
+```
+
 # Quick map
 
 ```{r plot, fig.width=10, fig.height=7}
 plot(
   landuse_gudenaa,
   type = "classes",
-  main = "Priority land use — gudenaa"
+  main = "Priority land use — Gudenå"
 )
 ```
 
 # Interpretation
 
 This output is a **current land-use predictor**, not a protection-status map.
-`Subclasses` contributes the distinction between forest nature and managed
-forest, but Basemap supplies the complete forest footprint. Before modelling,
+`Subclasses` contributes the distinction between forest nature and presumed
+managed forest, but Basemap supplies the forest footprint. Before modelling,
 inspect the audit and map, especially boundaries between `Forest*` and
 `ProductionForest`. If a separate authoritative unmanaged/natural-forest layer
 becomes available, merge it into `forest_nature_mask`; do not revert to using
-`Drevet Skov` alone for production forest.
+`Drevet Skov` alone for production forest. Checkpointing improves restartability,
+not the ecological certainty of this forest-management proxy.
+
+<!-- END OF RESTARTABLE DOCUMENT -->
