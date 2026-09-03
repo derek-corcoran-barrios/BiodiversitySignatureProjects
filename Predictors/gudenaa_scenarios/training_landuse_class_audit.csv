@@ -1,0 +1,13 @@
+id,class,cells
+1,ForestDryPoor,15041
+2,ForestWetPoor,2009
+3,ForestDryRich,1944
+4,ForestWetRich,1836
+5,OpenDryPoor,93810
+6,OpenWetPoor,8597
+7,OpenDryRich,15141
+8,OpenWetRich,166919
+9,Agriculture,1970594
+10,Urban,438594
+11,ProductionForest,409479
+12,Other,183688

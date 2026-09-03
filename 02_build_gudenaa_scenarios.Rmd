@@ -1,5 +1,5 @@
 ---
-title: "Build eight gudenaa nature-restoration scenarios"
+title: "Build eight Gudenå nature-restoration scenarios"
 output:
   html_document:
     toc: true
@@ -10,584 +10,920 @@ params:
   current_landuse_file: "Predictors/gudenaa_landuse/Landuse_gudenaa_current.tif"
   landuse_legend_file: "Predictors/gudenaa_landuse/Landuse_class_legend.csv"
   gudenaa_file: "Datasets/greater_area_gudenaaen.shp"
-  current_climate_file: ""
+  current_climate_file: "Predictors/Climate/chelsa_current_bio_DNK.tif"
   current_predictor_manifest_file: "Predictors/current_predictor_paths.rds"
+  expected_climate_layers: 5
+  terra_memmax_gb: 8
   output_dir: "Predictors/gudenaa_scenarios"
+  intermediate_dir: "Intermediates/gudenaa_scenarios"
+  checkpoint_revision: "v1"
+  input_fingerprint: "metadata"
+  run_checkpoint_smoke_test: true
   overwrite: false
 ---
 
-# Purpose
+# Purpose and scope
 
-This workflow starts from the priority land-use raster created by
-`01_build_gudenaa_priority_landuse.Rmd`. It creates eight counterfactual
-rasters. In each one, **every Agriculture and ProductionForest cell** is changed
-to one of the eight nature types.
+This is **predictor preparation only**. It does not download occurrences, fit
+plant models, or calculate biodiversity. Run the separate
+targets_plant_biodiversity.R script after these inputs pass their audits.
 
-Existing nature, urban and other cells remain unchanged. The workflow also:
+This document retains the design of your original workflow:
 
-- aligns the existing current CHELSA stack to the gudenaa 10 m template;
-- writes separate national-training and local-projection manifests;
-- writes a scenario manifest in the list-column format used by
-  `SpeciesPoolR::load_one_scenario()`; and
-- audits geometry and the exact set of changed cells.
+- fit species models with national Danish land use and current CHELSA;
+- project current conditions and eight restoration scenarios only in Gudenå;
+- replace every current Agriculture and ProductionForest cell with one of the
+  eight nature types in each scenario;
+- leave existing nature, Urban, Other and missing cells unchanged.
 
-These are deliberately extreme, single-endpoint scenarios. They answer “what
-if every convertible production cell became this nature type?” They do not yet
-encode feasibility, restoration time, dispersal, succession or partial uptake.
+ProductionForest retains the **proxy definition from document 01**, not a newly
+verified forest-management inventory. These are extreme endpoint scenarios,
+not predictions of restoration feasibility, timescale or colonisation.
 
-The national/local split is essential. `FitSpeciesModels()` should use national
-land use and national CHELSA so Danish occurrence records remain inside the
-predictor domain. The national 10 m land-use raster is reduced to the existing
-CHELSA grid with nearest-neighbour resampling; CHELSA is not needlessly
-upsampled across all Denmark. Only current/scenario projections are restricted
-to gudenaa. Do not replace the training predictors with the local manifest
-unless the scientific intention is to fit from gudenaa records alone.
+The 10 m national land use is sampled onto the existing CHELSA grid with
+nearest neighbour. CHELSA is interpolated to 10 m **only in Gudenå**.
+Interpolation does not create 10 m climate information. Training with coarse
+land-use cells and projecting to fine habitat patches is a scale-transfer
+assumption; inspect the pilot before interpreting local effects as validated
+10 m predictions. All nine local projections use the same current climate.
+
+# Before running
+
+Your listed Predictors folder contains land use, not CHELSA. Set
+current_climate_file above to the existing **five-band current CHELSA TIFF**.
+An absolute path to the existing SpeciesPoolRExample project is acceptable.
+Alternatively, supply an existing current_predictor_paths.rds that references
+exactly one climate stack. No climate data are downloaded by this document.
+
+The boundary shapefile must have matching .shp, .shx, .dbf and .prj basenames.
+The workflow stops on a missing CRS; it does not guess one.
+
+Raster processing uses one thread and an 8 GB terra memory budget by default.
+This encourages file-backed operations; it is not a hard process-memory limit.
+
+# Restarting and recovering
+
+Completed rasters and tabular intermediates are stored under
+Intermediates/gudenaa_scenarios. Re-knit this document after an interruption:
+completed matching stages print [reuse]. Only incomplete or invalidated stages
+are rebuilt. No live SpatRaster pointers are saved in RDS checkpoints.
+
+Each stage has a content key for its inputs, recipe, parameters and terra
+version. Metadata fingerprinting checks file paths, sizes and modification
+times, and hashes small files. Choose input_fingerprint: "md5" for full content
+hashing of large TIFFs too; this costs an extra read of those files. Sidecars
+are included. Do not modify source files while this document is running.
+
+The eight scenario rasters and their audits are checkpointed separately.
+A later plotting/export failure will not require repeating their calculation.
+Keep the intermediates and this project together; checkpoints contain absolute
+paths and are not automatically relocatable. Never knit two copies into the
+same output/intermediate folders concurrently.
+
+A matching published output is reused even with overwrite: false. An unrelated
+or changed existing output is protected. To deliberately replace it, set
+overwrite: true; completed intermediates can still be reused. Old checkpoint
+versions are retained, not automatically deleted.
+
+The small checkpoint tests below run before any large raster operation. They
+cover category values, missing cells, a five-band raster, restart reuse,
+changed-input invalidation and interrupted writes.
 
 ```{r setup}
 knitr::opts_chunk$set(
-  collapse = TRUE,
-  comment = "#>",
-  error = FALSE,
-  message = TRUE,
-  warning = TRUE
+  collapse = TRUE, comment = "#>", error = FALSE,
+  message = TRUE, warning = TRUE, cache = FALSE
 )
-
-required_packages <- c("terra", "dplyr", "readr", "tibble", "knitr")
-missing_packages <- setdiff(
-  required_packages,
-  rownames(utils::installed.packages())
-)
-
-if (length(missing_packages) > 0L) {
-  stop(
-    "Install the missing packages first: ",
-    paste(missing_packages, collapse = ", "),
-    call. = FALSE
-  )
+required_packages <- c("terra", "dplyr", "readr", "tibble", "knitr", "digest")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install these packages first: ",
+       paste(missing_packages, collapse = ", "), call. = FALSE)
 }
-
+Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1",
+           MKL_NUM_THREADS = "1", VECLIB_MAXIMUM_THREADS = "1",
+           GDAL_NUM_THREADS = "1")
 library(terra)
 library(dplyr)
-
-# Parallelism belongs at the targets/crew level. Each raster worker should use
-# one GDAL/OpenMP thread to avoid nested oversubscription on the server.
-Sys.setenv(
-  OMP_NUM_THREADS = "1",
-  OPENBLAS_NUM_THREADS = "1",
-  MKL_NUM_THREADS = "1",
-  VECLIB_MAXIMUM_THREADS = "1"
-)
-terra::terraOptions(progress = 1L, threads = 1L)
+if (length(params$terra_memmax_gb) != 1L ||
+    !is.finite(params$terra_memmax_gb) || params$terra_memmax_gb <= 0) {
+  stop("terra_memmax_gb must be one positive finite number.")
+}
+terra_settings <- list(progress = 1L, memmax = params$terra_memmax_gb,
+                       memmin = 0, memfrac = 0.05)
+if ("threads" %in% names(terra::terraOptions(print = FALSE))) {
+  terra_settings$threads <- 1L
+}
+do.call(terra::terraOptions, terra_settings)
+if (!params$input_fingerprint %in% c("metadata", "md5")) {
+  stop("input_fingerprint must be metadata or md5.")
+}
+if (length(params$expected_climate_layers) != 1L ||
+    !is.finite(params$expected_climate_layers) ||
+    params$expected_climate_layers < 1 ||
+    params$expected_climate_layers != floor(params$expected_climate_layers)) {
+  stop("expected_climate_layers must be a positive integer.")
+}
+dir.create(params$intermediate_dir, recursive = TRUE, showWarnings = FALSE)
+checkpoint_records <- new.env(parent = emptyenv())
 ```
 
 # Helpers
 
 ```{r helpers}
 assert_files_exist <- function(paths) {
-  paths <- unique(as.character(paths))
-  paths <- paths[!is.na(paths) & nzchar(paths)]
-  missing <- paths[!file.exists(paths)]
-
-  if (length(missing) > 0L) {
-    stop(
-      "Missing input files:\n- ",
-      paste(missing, collapse = "\n- "),
-      call. = FALSE
-    )
+  if (!is.character(paths) || !length(paths) || anyNA(paths) || any(!nzchar(paths))) {
+    stop("Input paths must be non-empty character strings.", call. = FALSE)
   }
-
+  missing <- paths[!file.exists(paths)]
+  if (length(missing)) {
+    stop("Missing input files:\n- ", paste(missing, collapse = "\n- "), call. = FALSE)
+  }
   invisible(paths)
 }
-
 snake_case <- function(x) {
   x <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", x)
-  x <- gsub("[^A-Za-z0-9]+", "_", x)
-  tolower(gsub("^_+|_+$", "", x))
+  tolower(gsub("^_+|_+$", "", gsub("[^A-Za-z0-9]+", "_", x)))
 }
-
 count_true <- function(x) {
-  as.numeric(
-    terra::global(
-      terra::ifel(!is.na(x) & x, 1, 0),
-      fun = "sum",
-      na.rm = TRUE
-    )[1, 1]
-  )
+  as.numeric(terra::global(terra::ifel(!is.na(x) & x, 1, 0),
+                           fun = "sum", na.rm = TRUE)[1, 1])
 }
-
 sum_where <- function(values, condition) {
-  as.numeric(
-    terra::global(
-      terra::ifel(condition, values, NA),
-      fun = "sum",
-      na.rm = TRUE
-    )[1, 1]
-  )
+  as.numeric(terra::global(terra::ifel(!is.na(condition) & condition, values, NA),
+                           fun = "sum", na.rm = TRUE)[1, 1])
 }
-
-write_landuse_raster <- function(x, filename, overwrite = FALSE) {
-  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
-
-  terra::writeRaster(
-    x,
-    filename = filename,
-    overwrite = overwrite,
-    datatype = "INT1U",
-    NAflag = 255,
-    gdal = c(
-      "COMPRESS=DEFLATE",
-      "PREDICTOR=2",
-      "TILED=YES",
-      "BIGTIFF=IF_SAFER"
-    )
-  )
-
-  filename
+complete_domain <- function(x) {
+  valid <- terra::app(is.finite(x), fun = "sum")
+  out <- terra::ifel(valid == terra::nlyr(x), 1, NA)
+  names(out) <- "prediction_domain"
+  out
 }
-
-is_landuse_raster <- function(path) {
-  x <- terra::rast(path)
-  category_tables <- terra::levels(x)
-  has_categories <- length(category_tables) > 0L &&
-    !is.null(category_tables[[1]]) &&
-    nrow(category_tables[[1]]) > 0L
-
-  any(tolower(names(x)) == "landuse") ||
-    (terra::nlyr(x) == 1L && has_categories)
+scenario_values <- function(current, target_id, convertible_ids) {
+  current <- as.numeric(current)
+  terra::ifel(current %in% convertible_ids, target_id, current)
 }
-
-resolve_current_climate <- function(
-    explicit_path,
-    predictor_manifest,
-    current_landuse_path) {
-  if (!is.null(explicit_path) && nzchar(explicit_path)) {
+validate_ids <- function(x, allowed) {
+  tab <- terra::freq(as.numeric(x))
+  if (is.null(tab) || !nrow(tab) ||
+      any(!tab$value %in% allowed) || any(!is.finite(tab$value))) {
+    stop("Land use is empty or has IDs outside the legend.", call. = FALSE)
+  }
+  tab
+}
+assert_crs <- function(x, label) {
+  if (!nzchar(terra::crs(x))) {
+    stop(label, " has no readable CRS. Check its metadata / matching .prj file.",
+         call. = FALSE)
+  }
+  invisible(x)
+}
+read_boundary <- function(path, target_crs) {
+  x <- terra::vect(path)
+  assert_crs(x, "Gudenå boundary")
+  terra::project(terra::aggregate(terra::makeValid(x)), target_crs)
+}
+resolve_current_climate <- function(explicit_path, predictor_manifest) {
+  if (is.character(explicit_path) && length(explicit_path) == 1L &&
+      !is.na(explicit_path) && nzchar(explicit_path)) {
     assert_files_exist(explicit_path)
     return(explicit_path)
   }
-
-  assert_files_exist(predictor_manifest)
-  manifest_paths <- unique(unlist(readRDS(predictor_manifest), use.names = FALSE))
-  manifest_paths <- manifest_paths[
-    !is.na(manifest_paths) & nzchar(manifest_paths)
-  ]
-  assert_files_exist(manifest_paths)
-
-  normal_current_landuse <- normalizePath(
-    current_landuse_path,
-    winslash = "/",
-    mustWork = TRUE
-  )
-  normal_manifest <- normalizePath(
-    manifest_paths,
-    winslash = "/",
-    mustWork = TRUE
-  )
-
-  candidates <- manifest_paths[normal_manifest != normal_current_landuse]
-  candidates <- candidates[!vapply(candidates, is_landuse_raster, logical(1))]
-
-  if (length(candidates) != 1L) {
+  if (!file.exists(predictor_manifest)) {
     stop(
-      "Could not identify exactly one current climate stack in `", 
-      predictor_manifest, "`. Set `current_climate_file` explicitly. ",
-      "Candidates found: ", length(candidates),
+      "No current CHELSA stack was supplied. Set current_climate_file to your ",
+      "existing five-band TIFF. The default fallback manifest also does not exist: ",
+      predictor_manifest, ". This document does not download climate data.",
       call. = FALSE
     )
   }
-
+  paths <- unique(unlist(readRDS(predictor_manifest), use.names = FALSE))
+  assert_files_exist(paths)
+  candidates <- paths[vapply(paths, function(path) {
+    x <- terra::rast(path)
+    terra::nlyr(x) == params$expected_climate_layers &&
+      !any(terra::is.factor(x)) &&
+      !any(tolower(names(x)) == "landuse")
+  }, logical(1))]
+  if (length(candidates) != 1L) {
+    stop("Cannot identify exactly one current climate stack. ",
+         "Set current_climate_file explicitly.", call. = FALSE)
+  }
   candidates[[1]]
 }
+# Tiny final tables/manifests are regenerated cheaply, but not silently replaced
+# when they belong to a different run.
+write_small_output <- function(object, filename, kind = c("rds", "csv")) {
+  kind <- match.arg(kind)
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  tmp <- tempfile("publish_table_", tmpdir = dirname(filename))
+  on.exit(unlink(tmp), add = TRUE)
+  if (kind == "rds") saveRDS(object, tmp) else {
+    readr::write_csv(object, tmp, na = "")
+  }
+  if (file.exists(filename)) {
+    same <- identical(unname(tools::md5sum(tmp)), unname(tools::md5sum(filename)))
+    if (same) return(filename)
+    if (!isTRUE(params$overwrite)) {
+      stop("Existing table/manifest differs: ", filename,
+           ". Set overwrite: true only if replacement is intended.", call. = FALSE)
+    }
+  }
+  if (!file.copy(tmp, filename, overwrite = TRUE)) {
+    stop("Cannot publish ", filename, call. = FALSE)
+  }
+  filename
+}
 ```
 
-# Read current land use and dictionary
+```{r checkpoint-helpers}
+file_stamp <- function(paths) {
+  if (!length(paths) || any(!file.exists(paths))) return(NULL)
+  info <- file.info(paths)
+  if (any(is.na(info$size)) || any(info$isdir)) return(NULL)
+  data.frame(
+    path = normalizePath(paths, winslash = "/", mustWork = TRUE),
+    bytes = as.numeric(info$size),
+    modified = as.numeric(info$mtime),
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+}
 
-```{r read-landuse}
-assert_files_exist(c(
-  params$national_current_landuse_file,
-  params$current_landuse_file,
-  params$landuse_legend_file,
-  params$gudenaa_file
-))
+input_signature <- function(path) {
+  assert_files_exist(path)
+  if (tolower(tools::file_ext(path)) == "vrt") {
+    stop("Materialize VRT inputs to GeoTIFF before checkpointing.", call. = FALSE)
+  }
+  stem <- tools::file_path_sans_ext(path)
+  sidecars <- c(
+    paste0(path, c(".aux.xml", ".vat.dbf", ".ovr", ".xml")),
+    paste0(stem, c(".prj", ".PRJ", ".tfw", ".TFW", ".wld", ".ige"))
+  )
+  if (tolower(tools::file_ext(path)) == "shp") {
+    sidecars <- c(sidecars, paste0(stem, c(
+      ".dbf", ".shx", ".cpg", ".qix", ".sbn", ".sbx",
+      ".DBF", ".SHX", ".CPG"
+    )))
+  }
+  paths <- sort(unique(c(path, sidecars[file.exists(sidecars)])))
+  stamp <- file_stamp(paths)
+  if (is.null(stamp)) stop("Cannot fingerprint input: ", path, call. = FALSE)
+  hash_files <- params$input_fingerprint == "md5" | stamp$bytes <= 10 * 1024^2
+  stamp$md5 <- NA_character_
+  if (any(hash_files)) {
+    stamp$md5[hash_files] <- unname(tools::md5sum(stamp$path[hash_files]))
+    if (anyNA(stamp$md5[hash_files])) {
+      stop("Cannot hash an input file for: ", path, call. = FALSE)
+    }
+  }
+  stamp
+}
 
-landuse_legend <- readr::read_csv(
-  params$landuse_legend_file,
-  show_col_types = FALSE
+checkpoint_ref <- function(name) {
+  record <- get(name, envir = checkpoint_records, inherits = FALSE)
+  list(key = record$key, files = record$files)
+}
+
+checkpoint_stage <- function(
+    name, inputs, build, kind = c("raster", "rds"),
+    helpers = list(), datatype = "INT1U",
+    category_table = NULL, layer_name = NULL) {
+  kind <- match.arg(kind)
+  stopifnot(length(name) == 1L, grepl("^[A-Za-z0-9_]+$", name))
+  # Hash code text, not source-reference attributes or closure environments:
+  # temporary knit filenames and changed report line numbers are not inputs.
+  function_code <- function(f) list(
+    formals = paste(deparse(formals(f), width.cutoff = 500L,
+                           control = c("keepInteger", "keepNA")), collapse = "\n"),
+    body = paste(deparse(body(f), width.cutoff = 500L,
+                        control = c("keepInteger", "keepNA")), collapse = "\n")
+  )
+  key <- digest::digest(list(
+    schema = 2L,
+    revision = params$checkpoint_revision,
+    terra = as.character(utils::packageVersion("terra")),
+    kind = kind, datatype = datatype,
+    categories = category_table, layer_name = layer_name,
+    inputs = inputs,
+    recipe = function_code(build),
+    helpers = lapply(helpers, function_code)
+  ), algo = "xxhash64")
+  stage_dir <- file.path(params$intermediate_dir, name, key)
+  marker_path <- file.path(stage_dir, "complete.rds")
+  record <- if (file.exists(marker_path)) {
+    tryCatch(readRDS(marker_path), error = function(e) NULL)
+  } else NULL
+
+  restore <- function(record) {
+    if (identical(record$kind, "rds")) return(readRDS(record$path))
+    x <- terra::rast(record$path)
+    if (terra::nlyr(x) != length(record$layer_names)) {
+      stop("Invalid checkpoint layer count.")
+    }
+    if (is.data.frame(record$category_table) &&
+        ncol(record$category_table) >= 2L) {
+      levels(x) <- record$category_table
+    }
+    names(x) <- record$layer_names
+    x
+  }
+
+  if (is.list(record) && identical(record$key, key) &&
+      is.data.frame(record$files) && nrow(record$files) > 0L &&
+      identical(file_stamp(record$files$path), record$files)) {
+    cached <- tryCatch(restore(record), error = function(e) NULL)
+    if (!is.null(cached)) {
+      assign(name, record, envir = checkpoint_records)
+      message("[reuse] ", name)
+      return(cached)
+    }
+  }
+
+  message("[build] ", name)
+  dir.create(stage_dir, recursive = TRUE, showWarnings = FALSE)
+  artifact_path <- tempfile(
+    pattern = paste0(name, "_"), tmpdir = stage_dir,
+    fileext = if (kind == "raster") ".tif" else ".rds"
+  )
+  value <- build()
+  record <- list(key = key, kind = kind)
+  if (kind == "raster") {
+    stopifnot(inherits(value, "SpatRaster"), terra::nlyr(value) >= 1L)
+    if (!is.null(category_table) && terra::nlyr(value) != 1L) {
+      stop("Category tables are only supported for a single categorical layer.")
+    }
+    if (!is.null(category_table)) levels(value) <- category_table
+    if (!is.null(layer_name)) names(value) <- layer_name
+    record$layer_names <- names(value)
+    category_tables <- terra::levels(value)
+    record$category_table <- if (length(category_tables)) {
+      category_tables[[1]]
+    } else NULL
+    wopt <- list(
+      datatype = datatype,
+      gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER")
+    )
+    if (datatype == "INT1U") wopt$NAflag <- 255
+    terra::writeRaster(value, filename = artifact_path, overwrite = FALSE,
+                       wopt = wopt)
+  } else {
+    saveRDS(value, artifact_path)
+  }
+  record$path <- normalizePath(artifact_path, winslash = "/", mustWork = TRUE)
+  # These are the sidecars generated/used by our GeoTIFF checkpoints.
+  sidecars <- paste0(record$path, c(".aux.xml", ".vat.dbf", ".ovr"))
+  record$files <- file_stamp(c(record$path, sidecars[file.exists(sidecars)]))
+  if (is.null(record$files)) stop("Checkpoint write failed for ", name)
+  result <- restore(record)
+  record$completed_at <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+  # Written last: an interrupted/truncated marker is never a cache hit.
+  saveRDS(record, marker_path)
+  assign(name, record, envir = checkpoint_records)
+  message("[saved] ", name)
+  result
+}
+
+publish_checkpoint <- function(name, filename, overwrite = FALSE) {
+  record <- get(name, envir = checkpoint_records, inherits = FALSE)
+  stopifnot(identical(record$kind, "raster"))
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  marker <- paste0(filename, ".checkpoint.rds")
+  previous <- if (file.exists(marker)) {
+    tryCatch(readRDS(marker), error = function(e) NULL)
+  } else NULL
+  reference <- checkpoint_ref(name)
+  same_source <- is.list(previous) && identical(previous$source, reference)
+  if (same_source && identical(previous$state, "complete") &&
+      is.data.frame(previous$files) &&
+      identical(file_stamp(previous$files$path), previous$files)) {
+    message("[reuse output] ", filename)
+    return(filename)
+  }
+  # Copy the compressed TIFF plus its category sidecars, rather than
+  # decompressing and recompressing the national raster a second time.
+  suffix <- substring(record$files$path, nchar(record$path) + 1L)
+  destinations <- paste0(filename, suffix)
+  known_sidecars <- paste0(filename, c(".aux.xml", ".vat.dbf", ".ovr"))
+  existing <- unique(c(destinations, known_sidecars))
+  continuing_own_copy <- same_source && identical(previous$state, "writing")
+  if (any(file.exists(existing)) && !isTRUE(overwrite) && !continuing_own_copy) {
+    stop(
+      "Existing output has no matching completed checkpoint: ", filename,
+      ". Choose a new output_dir, or set overwrite: true if replacement ",
+      "is intended. All completed intermediates remain available.",
+      call. = FALSE
+    )
+  }
+  saveRDS(list(source = reference, state = "writing"), marker)
+  # Only obsolete sidecars for this explicitly permitted output are removed.
+  obsolete <- setdiff(known_sidecars, destinations)
+  obsolete <- obsolete[file.exists(obsolete)]
+  if (length(obsolete) && any(unlink(obsolete) != 0L)) {
+    stop("Could not remove obsolete sidecars for ", filename, call. = FALSE)
+  }
+  copied <- file.copy(record$files$path, destinations, overwrite = TRUE)
+  if (!all(copied)) stop("Could not finish copying output: ", filename)
+  output_files <- file_stamp(destinations)
+  if (is.null(output_files) ||
+      !identical(output_files$bytes, record$files$bytes)) {
+    stop("Output copy has an unexpected size: ", filename, call. = FALSE)
+  }
+  terra::rast(filename) # Confirm that the published TIFF can be opened.
+  saveRDS(list(source = reference, state = "complete", files = output_files), marker)
+  message("[published] ", filename)
+  filename
+}
+```
+
+```{r checkpoint-smoke-test, echo=FALSE, message=FALSE}
+if (isTRUE(params$run_checkpoint_smoke_test)) {
+  local({
+    test_dir <- tempfile("gudenaa_scenarios_checkpoint_test_")
+    dir.create(test_dir)
+    # Give the helpers an isolated folder/registry; production checkpoints
+    # and parameters are not modified by this test.
+    test_env <- new.env(parent = environment(checkpoint_stage))
+    test_env$params <- utils::modifyList(params, list(intermediate_dir = test_dir))
+    test_env$checkpoint_records <- new.env(parent = emptyenv())
+    for (helper in c("file_stamp", "checkpoint_ref", "checkpoint_stage",
+                     "publish_checkpoint")) {
+      f <- get(helper, envir = environment(checkpoint_stage))
+      environment(f) <- test_env
+      assign(helper, f, envir = test_env)
+    }
+    builds <- 0L
+    build_test_raster <- function() {
+      builds <<- builds + 1L
+      x <- terra::rast(nrows = 2, ncols = 2, xmin = 0, xmax = 2,
+                       ymin = 0, ymax = 2, crs = "EPSG:25832")
+      values(x) <- c(1, 9, 11, NA_real_)
+      x
+    }
+    test_categories <- data.frame(id = c(1L, 9L, 11L),
+                                  class = c("ForestDryPoor", "Agriculture", "ProductionForest"))
+    first <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 1L), build = build_test_raster,
+      category_table = test_categories
+    )
+    first_path <- terra::sources(first)
+    # Reset the in-memory registry: the hit must come from files on disk.
+    test_env$checkpoint_records <- new.env(parent = emptyenv())
+    second <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 1L), build = build_test_raster,
+      category_table = test_categories
+    )
+    # terra/GDAL may read a missing cell as NaN rather than R's NA_real_.
+    # Test the missing-cell mask separately, then require exact category IDs.
+    expected_values <- c(1, 9, 11, NA_real_)
+    actual_values <- as.numeric(terra::values(second))
+    observed <- !is.na(expected_values)
+    values_ok <-
+      length(actual_values) == length(expected_values) &&
+      identical(is.na(actual_values), is.na(expected_values)) &&
+      identical(actual_values[observed], expected_values[observed])
+    if (!values_ok) {
+      stop(
+        "Checkpoint read-back values differ. Expected: ",
+        paste(expected_values, collapse = ", "),
+        "; read back: ", paste(actual_values, collapse = ", "),
+        ". Do not disable the self-test; inspect this mismatch first.",
+        call. = FALSE
+      )
+    }
+    stopifnot(
+      builds == 1L, identical(first_path, terra::sources(second)),
+      identical(as.character(levels(second)[[1]][[2]]), test_categories$class)
+    )
+    # A real five-band cache round-trip, not only a categorical raster test.
+    climate_builds <- 0L
+    build_climate <- function() {
+      climate_builds <<- climate_builds + 1L
+      x <- terra::rast(nrows = 2, ncols = 2, nlyrs = 5, xmin = 0, xmax = 2,
+                       ymin = 0, ymax = 2, crs = "EPSG:25832")
+      values(x) <- matrix(seq_len(20) / 10, ncol = 5)
+      names(x) <- paste0("bio", 1:5)
+      x
+    }
+    climate_first <- test_env$checkpoint_stage(
+      "test_climate", list(), build_climate, datatype = "FLT8S"
+    )
+    test_env$checkpoint_records <- new.env(parent = emptyenv())
+    climate_second <- test_env$checkpoint_stage(
+      "test_climate", list(), build_climate, datatype = "FLT8S"
+    )
+    stopifnot(
+      climate_builds == 1L, terra::nlyr(climate_second) == 5L,
+      identical(names(climate_second), paste0("bio", 1:5)),
+      isTRUE(all.equal(as.numeric(terra::values(climate_second)),
+                       as.numeric(matrix(seq_len(20) / 10, ncol = 5)),
+                       tolerance = 1e-12))
+    )
+    converted <- scenario_values(second, target_id = 3L, convertible_ids = c(9L, 11L))
+    converted_values <- as.numeric(terra::values(converted))
+    stopifnot(
+      all(converted_values[1:3] == c(1, 3, 3)),
+      is.na(converted_values[4])
+    )
+    # Re-register the raster after testing a fresh in-memory registry.
+    second <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 1L), build = build_test_raster,
+      category_table = test_categories
+    )
+    published <- file.path(test_dir, "published.tif")
+    test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+    test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+    third <- test_env$checkpoint_stage(
+      "test_raster", inputs = list(version = 2L), build = build_test_raster,
+      category_table = test_categories
+    )
+    stopifnot(builds == 2L, !identical(first_path, terra::sources(third)))
+    protected <- tryCatch({
+      test_env$publish_checkpoint("test_raster", published, overwrite = FALSE)
+      FALSE
+    }, error = function(e) TRUE)
+    stopifnot(protected)
+    fail_once <- TRUE
+    build_test_table <- function() {
+      if (fail_once) {
+        fail_once <<- FALSE
+        stop("Intentional smoke-test interruption.")
+      }
+      data.frame(ok = TRUE)
+    }
+    failed <- tryCatch({
+      test_env$checkpoint_stage("test_retry", list(), build_test_table, kind = "rds")
+      FALSE
+    }, error = function(e) TRUE)
+    table <- test_env$checkpoint_stage(
+      "test_retry", list(), build_test_table, kind = "rds"
+    )
+    stopifnot(failed, identical(table, data.frame(ok = TRUE)))
+  })
+  cat("Checkpoint self-test passed.\n")
+}
+```
+
+# Read and validate sources
+
+```{r read-inputs}
+assert_files_exist(c(params$national_current_landuse_file,
+                     params$current_landuse_file, params$landuse_legend_file,
+                     params$gudenaa_file))
+current_climate_source <- resolve_current_climate(
+  params$current_climate_file, params$current_predictor_manifest_file
 )
-
+landuse_legend <- as.data.frame(readr::read_csv(
+  params$landuse_legend_file, show_col_types = FALSE, progress = FALSE
+))
 required_legend_columns <- c("id", "class", "role")
 if (!all(required_legend_columns %in% names(landuse_legend))) {
-  stop(
-    "The land-use legend must contain: ",
-    paste(required_legend_columns, collapse = ", "),
-    call. = FALSE
-  )
+  stop("The legend must contain id, class and role.")
 }
-
-expected_nature_classes <- c(
+expected_classes <- c(
   "ForestDryPoor", "ForestWetPoor", "ForestDryRich", "ForestWetRich",
-  "OpenDryPoor", "OpenWetPoor", "OpenDryRich", "OpenWetRich"
+  "OpenDryPoor", "OpenWetPoor", "OpenDryRich", "OpenWetRich",
+  "Agriculture", "Urban", "ProductionForest", "Other"
 )
-
-if (!setequal(
-  landuse_legend$class[landuse_legend$role == "nature"],
-  expected_nature_classes
-)) {
-  stop("The legend does not contain the expected eight nature classes.", call. = FALSE)
+if (nrow(landuse_legend) != 12L || anyNA(landuse_legend$id) ||
+    anyDuplicated(landuse_legend$id) || anyDuplicated(landuse_legend$class) ||
+    !identical(as.integer(landuse_legend$id[match(expected_classes, landuse_legend$class)]),
+               1:12)) {
+  stop("The legend must preserve the 12 class IDs established in document 01.")
 }
-
-code_for <- function(class_name) {
-  out <- landuse_legend$id[match(class_name, landuse_legend$class)]
-  if (length(out) != 1L || is.na(out)) {
-    stop("Unknown land-use class: ", class_name, call. = FALSE)
-  }
-  as.integer(out)
+if (!setequal(landuse_legend$class[landuse_legend$role %in% "nature"],
+              expected_classes[1:8])) {
+  stop("The nature role must identify exactly the eight nature types.")
 }
-
+class_table <- data.frame(id = as.integer(landuse_legend$id),
+                          class = as.character(landuse_legend$class))
+convertible_ids <- c(9L, 11L)
+national_current_landuse <- terra::rast(params$national_current_landuse_file)
 current_landuse <- terra::rast(params$current_landuse_file)
-if (terra::nlyr(current_landuse) != 1L) {
-  stop("Current land use must have exactly one layer.", call. = FALSE)
+climate_source <- terra::rast(current_climate_source)
+for (x in list(national_current_landuse, current_landuse, climate_source)) {
+  assert_crs(x, "An input raster")
 }
-
-names(current_landuse) <- "Landuse"
-current_landuse_numeric <- as.numeric(current_landuse)
-
-national_current_landuse <- terra::rast(
-  params$national_current_landuse_file
-)
-if (terra::nlyr(national_current_landuse) != 1L) {
-  stop("National current land use must have exactly one layer.", call. = FALSE)
+stopifnot(terra::nlyr(national_current_landuse) == 1L,
+          terra::nlyr(current_landuse) == 1L)
+if (terra::nlyr(climate_source) != params$expected_climate_layers ||
+    any(terra::is.factor(climate_source)) || anyNA(names(climate_source)) ||
+    any(!nzchar(names(climate_source))) || anyDuplicated(names(climate_source)) ||
+    any(tolower(names(climate_source)) == "landuse")) {
+  stop("CHELSA must contain the expected number of uniquely named continuous bands.")
 }
+climate_names <- names(climate_source)
 names(national_current_landuse) <- "Landuse"
-
-gudenaa <- params$gudenaa_file |>
-  terra::vect() |>
-  terra::makeValid() |>
-  terra::aggregate() |>
-  terra::project(terra::crs(current_landuse))
-
-current_landuse_numeric <- terra::mask(
-  current_landuse_numeric,
-  gudenaa
+names(current_landuse) <- "Landuse"
+gudenaa <- read_boundary(params$gudenaa_file, terra::crs(current_landuse))
+source_signatures <- list(
+  national_landuse = input_signature(params$national_current_landuse_file),
+  local_landuse = input_signature(params$current_landuse_file),
+  climate = input_signature(current_climate_source),
+  boundary = input_signature(params$gudenaa_file),
+  legend = input_signature(params$landuse_legend_file)
 )
-```
-
-# Align current CHELSA to the small template
-
-Only the gudenaa extent is resampled to 10 m. Climate is continuous, so
-bilinear interpolation is used; land use is never bilinearly interpolated.
-
-```{r align-climate}
-current_climate_source <- resolve_current_climate(
-  explicit_path = params$current_climate_file,
-  predictor_manifest = params$current_predictor_manifest_file,
-  current_landuse_path = params$current_landuse_file
-)
-
-assert_files_exist(current_climate_source)
 dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
-
-climate_output_path <- file.path(
-  params$output_dir,
-  "CHELSA_current_gudenaa_10m.tif"
-)
-
-current_climate_source_raster <- terra::rast(current_climate_source)
-
-# Categorical training land use is placed on the existing national CHELSA
-# grid. This is far smaller and more honest than manufacturing national 10 m
-# climate values. Nearest neighbour is mandatory for the class IDs.
-training_landuse_output_path <- file.path(
-  params$output_dir,
-  "Landuse_Denmark_training_on_CHELSA_grid.tif"
-)
-
-training_landuse <- terra::project(
-  national_current_landuse,
-  current_climate_source_raster[[1]],
-  method = "near"
-)
-training_landuse <- terra::mask(
-  training_landuse,
-  current_climate_source_raster[[1]]
-)
-names(training_landuse) <- "Landuse"
-terra::levels(training_landuse) <- as.data.frame(
-  landuse_legend[c("id", "class")]
-)
-
-write_landuse_raster(
-  training_landuse,
-  filename = training_landuse_output_path,
-  overwrite = params$overwrite
-)
-
-if (!terra::compareGeom(
-  training_landuse,
-  current_climate_source_raster,
-  stopOnError = FALSE
-)) {
-  stop("National training land use does not match CHELSA.", call. = FALSE)
-}
-
-# Use a separate temporary file so GDAL never needs to overwrite a raster that
-# is still open. This matters especially on Windows servers.
-climate_projected_path <- tempfile(
-  pattern = "CHELSA_current_gudenaa_projected_",
-  fileext = ".tif"
-)
-
-current_climate_projected <- terra::project(
-  current_climate_source_raster,
-  current_landuse_numeric,
-  method = "bilinear",
-  filename = climate_projected_path,
-  overwrite = TRUE,
-  wopt = list(
-    datatype = "FLT4S",
-    gdal = c(
-      "COMPRESS=DEFLATE",
-      "PREDICTOR=3",
-      "TILED=YES",
-      "BIGTIFF=IF_SAFER"
-    )
-  )
-)
-
-current_climate <- terra::mask(
-  current_climate_projected,
-  current_landuse_numeric,
-  filename = climate_output_path,
-  overwrite = params$overwrite,
-  wopt = list(
-    datatype = "FLT4S",
-    gdal = c("COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES")
-  )
-)
-
-rm(current_climate_projected)
-invisible(gc())
-unlink(climate_projected_path)
-
-if (!terra::compareGeom(
-  current_climate,
-  current_landuse_numeric,
-  stopOnError = FALSE
-)) {
-  stop("The aligned CHELSA stack does not match land use.", call. = FALSE)
-}
-
-finite_climate_cells <- terra::global(
-  terra::app(!is.na(current_climate), sum) == terra::nlyr(current_climate),
-  fun = "sum",
-  na.rm = TRUE
-)[1, 1]
-
-if (!is.finite(finite_climate_cells) || finite_climate_cells == 0) {
-  stop("Aligned CHELSA contains no cells complete across all bands.", call. = FALSE)
-}
 ```
 
-# Scenario specification
+# National training predictors
 
-The conversion mask contains exactly two current classes. Urban and Other are
-fixed, and existing nature cells keep their current class.
+The original CHELSA stack is cropped to the national land-use extent first.
+This prevents an accidentally larger climate input from causing global training
+projections. Both training files are published locally with matching geometry.
+
+```{r national-training}
+training_climate_unmasked <- checkpoint_stage(
+  "01_climate_Denmark_crop",
+  inputs = list(climate = source_signatures$climate,
+                landuse = source_signatures$national_landuse, bands = climate_names),
+  datatype = "FLT4S", layer_name = climate_names,
+  build = function() {
+    footprint <- terra::as.polygons(terra::ext(national_current_landuse),
+                                    crs = terra::crs(national_current_landuse))
+    footprint <- terra::project(footprint, terra::crs(climate_source))
+    terra::crop(climate_source, footprint, snap = "out")
+  }
+)
+training_landuse_unmasked <- checkpoint_stage(
+  "02_landuse_Denmark_CHELSA_grid",
+  inputs = list(source = source_signatures$national_landuse,
+                climate = checkpoint_ref("01_climate_Denmark_crop"),
+                categories = class_table),
+  category_table = class_table, layer_name = "Landuse",
+  build = function() {
+    terra::project(as.numeric(national_current_landuse),
+                   training_climate_unmasked[[1]], method = "near")
+  }
+)
+training_domain <- checkpoint_stage(
+  "03_training_domain",
+  inputs = list(landuse = checkpoint_ref("02_landuse_Denmark_CHELSA_grid"),
+                climate = checkpoint_ref("01_climate_Denmark_crop")),
+  helpers = list(complete_domain), layer_name = "prediction_domain",
+  build = function() {
+    complete_domain(c(as.numeric(training_landuse_unmasked), training_climate_unmasked))
+  }
+)
+training_landuse <- checkpoint_stage(
+  "04_training_landuse",
+  inputs = list(landuse = checkpoint_ref("02_landuse_Denmark_CHELSA_grid"),
+                domain = checkpoint_ref("03_training_domain")),
+  category_table = class_table, layer_name = "Landuse",
+  build = function() terra::mask(as.numeric(training_landuse_unmasked), training_domain)
+)
+training_climate <- checkpoint_stage(
+  "05_training_climate",
+  inputs = list(climate = checkpoint_ref("01_climate_Denmark_crop"),
+                domain = checkpoint_ref("03_training_domain")),
+  datatype = "FLT4S", layer_name = climate_names,
+  build = function() terra::mask(training_climate_unmasked, training_domain)
+)
+training_audit <- checkpoint_stage(
+  "06_training_audit",
+  inputs = list(landuse = checkpoint_ref("04_training_landuse"),
+                climate = checkpoint_ref("05_training_climate"),
+                categories = class_table),
+  kind = "rds", helpers = list(validate_ids, count_true),
+  build = function() {
+    stopifnot(terra::compareGeom(training_landuse, training_climate))
+    tab <- validate_ids(training_landuse, class_table$id)
+    if (!all(1:8 %in% tab$value)) {
+      stop("One or more restoration categories disappeared on the training grid. ",
+           "Inspect the land-use class audit before fitting.")
+    }
+    data.frame(id = tab$value,
+               class = class_table$class[match(tab$value, class_table$id)],
+               cells = tab$count)
+  }
+)
+knitr::kable(training_audit)
+```
+
+# Local current predictors and common prediction domain
+
+The published local baseline is a category-preserving, boundary-masked copy.
+Its geometry and class IDs are shared by all eight scenarios. The separate
+prediction-domain raster excludes cells missing any climate band; it is the
+same for every biodiversity comparison.
+
+```{r local-current}
+current_local <- checkpoint_stage(
+  "07_local_landuse",
+  inputs = list(landuse = source_signatures$local_landuse,
+                boundary = source_signatures$boundary, categories = class_table),
+  category_table = class_table, layer_name = "Landuse",
+  build = function() terra::mask(as.numeric(current_landuse), gudenaa)
+)
+climate_local_projected <- checkpoint_stage(
+  "08_climate_local_projected",
+  inputs = list(source = source_signatures$climate,
+                template = checkpoint_ref("07_local_landuse"), bands = climate_names),
+  datatype = "FLT4S", layer_name = climate_names,
+  build = function() {
+    terra::project(climate_source, current_local, method = "bilinear")
+  }
+)
+climate_local <- checkpoint_stage(
+  "09_climate_local_masked",
+  inputs = list(climate = checkpoint_ref("08_climate_local_projected"),
+                landuse = checkpoint_ref("07_local_landuse")),
+  datatype = "FLT4S", layer_name = climate_names,
+  build = function() terra::mask(climate_local_projected, current_local)
+)
+local_domain <- checkpoint_stage(
+  "10_local_prediction_domain",
+  inputs = list(landuse = checkpoint_ref("07_local_landuse"),
+                climate = checkpoint_ref("09_climate_local_masked")),
+  helpers = list(complete_domain), layer_name = "prediction_domain",
+  build = function() complete_domain(c(as.numeric(current_local), climate_local))
+)
+local_audit <- checkpoint_stage(
+  "11_local_audit",
+  inputs = list(landuse = checkpoint_ref("07_local_landuse"),
+                climate = checkpoint_ref("09_climate_local_masked"),
+                domain = checkpoint_ref("10_local_prediction_domain"),
+                legend = class_table),
+  kind = "rds", helpers = list(validate_ids, count_true),
+  build = function() {
+    stopifnot(terra::compareGeom(current_local, climate_local))
+    validate_ids(current_local, class_table$id)
+    n <- count_true(!is.na(local_domain))
+    if (!is.finite(n) || n == 0) stop("The local complete predictor domain is empty.")
+    data.frame(local_landuse_cells = count_true(!is.na(current_local)),
+               complete_predictor_cells = n,
+               landuse_cells_missing_climate = count_true(
+                 !is.na(current_local) & is.na(local_domain)))
+  }
+)
+knitr::kable(local_audit)
+```
+
+# Conversion mask and scenario specification
 
 ```{r scenario-specification}
-convertible_ids <- c(
-  code_for("Agriculture"),
-  code_for("ProductionForest")
+scenario_table <- data.frame(
+  scenario = paste0("all_to_", vapply(expected_classes[1:8], snake_case, character(1))),
+  target_id = 1:8, target_class = expected_classes[1:8]
 )
-
-scenario_table <- landuse_legend |>
-  dplyr::filter(.data$role == "nature") |>
-  dplyr::transmute(
-    scenario = paste0("all_to_", vapply(.data$class, snake_case, character(1))),
-    target_id = as.integer(.data$id),
-    target_class = .data$class
-  ) |>
-  dplyr::arrange(.data$target_id)
-
-if (nrow(scenario_table) != 8L) {
-  stop("Exactly eight nature scenarios are required.", call. = FALSE)
-}
-
-convertible_mask <- current_landuse_numeric %in% convertible_ids
-convertible_cells <- count_true(convertible_mask)
-
-if (convertible_cells == 0L) {
-  stop(
-    "No Agriculture or ProductionForest cells occur in the current map.",
-    call. = FALSE
-  )
-}
-
-cell_area_km2 <- terra::cellSize(current_landuse_numeric, unit = "km")
-convertible_area_km2 <- sum_where(cell_area_km2, convertible_mask)
-
+convertible_mask <- checkpoint_stage(
+  "12_convertible_mask",
+  inputs = list(landuse = checkpoint_ref("07_local_landuse"), ids = convertible_ids),
+  layer_name = "convertible",
+  build = function() {
+    terra::mask(terra::ifel(as.numeric(current_local) %in% convertible_ids, 1, 0),
+                current_local)
+  }
+)
+cell_area_km2 <- checkpoint_stage(
+  "13_local_cell_area",
+  inputs = list(template = checkpoint_ref("07_local_landuse")),
+  datatype = "FLT8S", layer_name = "cell_area_km2",
+  build = function() terra::mask(terra::cellSize(current_local, unit = "km"), current_local)
+)
+conversion_audit <- checkpoint_stage(
+  "14_conversion_audit",
+  inputs = list(mask = checkpoint_ref("12_convertible_mask"),
+                area = checkpoint_ref("13_local_cell_area")),
+  kind = "rds", helpers = list(count_true, sum_where),
+  build = function() {
+    n <- count_true(convertible_mask == 1)
+    if (!is.finite(n) || n == 0) stop("No Agriculture/ProductionForest cells were found.")
+    data.frame(convertible_cells = n,
+               convertible_area_km2 = sum_where(cell_area_km2, convertible_mask == 1))
+  }
+)
 knitr::kable(scenario_table)
+knitr::kable(conversion_audit, digits = 3)
 ```
 
-# Write the eight land-use rasters
+# Build and audit each scenario independently
+
+A checkpoint is marked complete only after the TIFF can be reopened. The
+separate audit verifies the missing-cell mask too, so new NA cells cannot
+silently pass the changed-cell checks.
 
 ```{r build-scenarios}
-scenario_directory <- file.path(params$output_dir, "landuse")
-dir.create(scenario_directory, recursive = TRUE, showWarnings = FALSE)
-
 scenario_results <- vector("list", nrow(scenario_table))
-
+scenario_stage_names <- character(nrow(scenario_table))
 for (i in seq_len(nrow(scenario_table))) {
   scenario_name <- scenario_table$scenario[[i]]
   target_id <- scenario_table$target_id[[i]]
-
-  scenario_numeric <- terra::ifel(
-    convertible_mask,
-    target_id,
-    current_landuse_numeric
+  stage_name <- paste0("15_", scenario_name)
+  scenario_stage_names[[i]] <- stage_name
+  scenario_raster <- checkpoint_stage(
+    stage_name,
+    inputs = list(current = checkpoint_ref("07_local_landuse"),
+                  convertible_ids = convertible_ids, target_id = target_id),
+    helpers = list(scenario_values), category_table = class_table, layer_name = "Landuse",
+    build = function() scenario_values(current_local, target_id, convertible_ids)
   )
-  scenario_raster <- scenario_numeric
-  names(scenario_raster) <- "Landuse"
-  terra::levels(scenario_raster) <- as.data.frame(
-    landuse_legend[c("id", "class")]
-  )
-
-  scenario_path <- file.path(
-    scenario_directory,
-    paste0("Landuse_gudenaa_", scenario_name, ".tif")
-  )
-
-  write_landuse_raster(
-    scenario_raster,
-    filename = scenario_path,
-    overwrite = params$overwrite
-  )
-
-  changed <- scenario_numeric != current_landuse_numeric
-  changed_outside_convertible <- changed & !convertible_mask
-  remaining_convertible <- scenario_numeric %in% convertible_ids
-
-  scenario_results[[i]] <- tibble::tibble(
-    scenario = scenario_name,
-    target_id = target_id,
-    target_class = scenario_table$target_class[[i]],
-    changed_cells = count_true(changed),
-    expected_changed_cells = convertible_cells,
-    changed_area_km2 = sum_where(cell_area_km2, changed),
-    expected_changed_area_km2 = convertible_area_km2,
-    changed_outside_convertible_cells = count_true(
-      changed_outside_convertible
-    ),
-    remaining_convertible_cells = count_true(remaining_convertible),
-    geometry_matches_current = terra::compareGeom(
-      scenario_raster,
-      current_landuse_numeric,
-      stopOnError = FALSE
-    ),
-    landuse_path = scenario_path
+  scenario_results[[i]] <- checkpoint_stage(
+    paste0("16_audit_", scenario_name),
+    inputs = list(scenario = checkpoint_ref(stage_name),
+                  current = checkpoint_ref("07_local_landuse"),
+                  mask = checkpoint_ref("12_convertible_mask"),
+                  area = checkpoint_ref("13_local_cell_area"),
+                  expected = conversion_audit, target_id = target_id,
+                  label = scenario_name),
+    kind = "rds", helpers = list(count_true, sum_where, validate_ids),
+    build = function() {
+      x <- as.numeric(scenario_raster)
+      baseline <- as.numeric(current_local)
+      validate_ids(x, class_table$id)
+      changed <- x != baseline
+      audit <- data.frame(
+        scenario = scenario_name, target_id = target_id,
+        target_class = expected_classes[[target_id]],
+        changed_cells = count_true(changed),
+        expected_changed_cells = conversion_audit$convertible_cells,
+        changed_area_km2 = sum_where(cell_area_km2, changed),
+        expected_changed_area_km2 = conversion_audit$convertible_area_km2,
+        changed_outside_convertible_cells = count_true(changed & convertible_mask != 1),
+        remaining_convertible_cells = count_true(x %in% convertible_ids),
+        wrong_destination_cells = count_true(convertible_mask == 1 & x != target_id),
+        missing_mask_changes = count_true(is.na(x) != is.na(baseline)),
+        geometry_matches_current = terra::compareGeom(x, baseline, stopOnError = FALSE)
+      )
+      tolerance <- max(1e-8, audit$expected_changed_area_km2 * 1e-10)
+      if (!isTRUE(audit$geometry_matches_current) ||
+          audit$changed_cells != audit$expected_changed_cells ||
+          audit$changed_outside_convertible_cells != 0 ||
+          audit$remaining_convertible_cells != 0 ||
+          audit$wrong_destination_cells != 0 || audit$missing_mask_changes != 0 ||
+          abs(audit$changed_area_km2 - audit$expected_changed_area_km2) > tolerance) {
+        stop("Scenario audit failed for ", scenario_name, call. = FALSE)
+      }
+      audit
+    }
   )
 }
-
 scenario_audit <- dplyr::bind_rows(scenario_results)
-
-if (any(
-  scenario_audit$changed_cells != scenario_audit$expected_changed_cells |
-    scenario_audit$changed_outside_convertible_cells != 0L |
-    scenario_audit$remaining_convertible_cells != 0L |
-    !scenario_audit$geometry_matches_current
-)) {
-  stop("At least one land-use scenario failed its audit.", call. = FALSE)
-}
-
-area_tolerance <- max(1e-8, convertible_area_km2 * 1e-10)
-if (any(abs(
-  scenario_audit$changed_area_km2 -
-    scenario_audit$expected_changed_area_km2
-) > area_tolerance)) {
-  stop("At least one scenario changed the wrong area.", call. = FALSE)
-}
-
-knitr::kable(
-  scenario_audit |>
-    dplyr::select(
-      .data$scenario,
-      .data$target_class,
-      .data$changed_cells,
-      .data$changed_area_km2,
-      .data$changed_outside_convertible_cells,
-      .data$remaining_convertible_cells
-    ),
-  digits = 3
-)
+knitr::kable(scenario_audit, digits = 3)
 ```
 
-# Write SpeciesPoolR manifests
+# Publish predictors and manifests
 
-The training manifest combines the new national land-use layer with the
-original national CHELSA stack. The projection manifest combines local current
-land use with local CHELSA. Every restoration scenario uses local current
-CHELSA. Later, a future-climate path can replace the second element of any
-scenario's `path` vector without changing the land-use files.
+The TIFFs below are persistent copies of completed intermediates. Keep their
+category sidecars with them. No source land-use TIFF is overwritten.
 
 ```{r write-manifests}
-training_current_predictor_paths <- c(
-  training_landuse_output_path,
-  current_climate_source
+training_landuse_output_path <- file.path(
+  params$output_dir, "Landuse_Denmark_training_on_CHELSA_grid.tif")
+training_climate_output_path <- file.path(
+  params$output_dir, "CHELSA_current_Denmark_training.tif")
+current_local_output_path <- file.path(
+  params$output_dir, "Landuse_gudenaa_projection_current.tif")
+climate_output_path <- file.path(params$output_dir, "CHELSA_current_gudenaa_10m.tif")
+training_domain_path <- file.path(params$output_dir, "Domain_Denmark_training.tif")
+local_domain_path <- file.path(params$output_dir, "Domain_gudenaa_projection.tif")
+publish_checkpoint("04_training_landuse", training_landuse_output_path, params$overwrite)
+publish_checkpoint("05_training_climate", training_climate_output_path, params$overwrite)
+publish_checkpoint("07_local_landuse", current_local_output_path, params$overwrite)
+publish_checkpoint("09_climate_local_masked", climate_output_path, params$overwrite)
+publish_checkpoint("03_training_domain", training_domain_path, params$overwrite)
+publish_checkpoint("10_local_prediction_domain", local_domain_path, params$overwrite)
+scenario_audit$landuse_path <- vapply(seq_len(nrow(scenario_table)), function(i) {
+  filename <- file.path(params$output_dir, "landuse",
+                        paste0("Landuse_gudenaa_", scenario_table$scenario[[i]], ".tif"))
+  publish_checkpoint(scenario_stage_names[[i]], filename, params$overwrite)
+}, character(1))
+training_current_predictor_paths <- c(training_landuse_output_path,
+                                      training_climate_output_path)
+projection_current_predictor_paths <- c(current_local_output_path, climate_output_path)
+scenario_specs <- data.frame(scenario = scenario_table$scenario, stringsAsFactors = FALSE)
+scenario_specs$path <- unname(lapply(scenario_audit$landuse_path,
+                                     function(x) c(x, climate_output_path)))
+write_small_output(training_current_predictor_paths, file.path(
+  params$output_dir, "training_current_predictor_paths_Denmark.rds"))
+write_small_output(projection_current_predictor_paths, file.path(
+  params$output_dir, "projection_current_predictor_paths_gudenaa.rds"))
+write_small_output(scenario_specs, file.path(
+  params$output_dir, "mixed_scenario_specs_gudenaa.rds"))
+write_small_output(scenario_audit, file.path(
+  params$output_dir, "landuse_scenario_audit.csv"), "csv")
+write_small_output(scenario_table, file.path(
+  params$output_dir, "landuse_scenario_table.csv"), "csv")
+write_small_output(training_audit, file.path(
+  params$output_dir, "training_landuse_class_audit.csv"), "csv")
+write_small_output(local_audit, file.path(
+  params$output_dir, "local_predictor_domain_audit.csv"), "csv")
+# A small machine-readable provenance record for the modelling pipeline.
+preparation <- list(
+  schema = 1L, training_extent = "Denmark", projection_extent = "Gudenå",
+  landuse_training_method = "nearest neighbour to native CHELSA grid",
+  climate_projection_method = "bilinear to local land-use grid",
+  climate_scenario = "current climate held constant in all restoration scenarios",
+  climate_names = climate_names, class_table = class_table,
+  source_signatures = source_signatures,
+  training_domain = training_domain_path, projection_domain = local_domain_path
 )
-
-projection_current_predictor_paths <- c(
-  params$current_landuse_file,
-  climate_output_path
-)
-
-scenario_specs <- data.frame(
-  scenario = scenario_audit$scenario,
-  stringsAsFactors = FALSE
-)
-scenario_specs$path <- unname(lapply(
-  scenario_audit$landuse_path,
-  function(landuse_path) c(landuse_path, climate_output_path)
-))
-
-training_manifest_path <- file.path(
-  params$output_dir,
-  "training_current_predictor_paths_Denmark.rds"
-)
-projection_current_manifest_path <- file.path(
-  params$output_dir,
-  "projection_current_predictor_paths_gudenaa.rds"
-)
-scenario_manifest_path <- file.path(
-  params$output_dir,
-  "mixed_scenario_specs_gudenaa.rds"
-)
-scenario_audit_path <- file.path(
-  params$output_dir,
-  "landuse_scenario_audit.csv"
-)
-scenario_table_path <- file.path(
-  params$output_dir,
-  "landuse_scenario_table.csv"
-)
-
-saveRDS(training_current_predictor_paths, training_manifest_path)
-saveRDS(
-  projection_current_predictor_paths,
-  projection_current_manifest_path
-)
-saveRDS(scenario_specs, scenario_manifest_path)
-readr::write_csv(scenario_audit, scenario_audit_path)
-readr::write_csv(scenario_table, scenario_table_path)
-
-c(
-  training_manifest = training_manifest_path,
-  projection_current_manifest = projection_current_manifest_path,
-  scenario_manifest = scenario_manifest_path,
-  scenario_audit = scenario_audit_path,
-  scenario_table = scenario_table_path,
-  climate = climate_output_path
-)
+write_small_output(preparation, file.path(params$output_dir, "predictor_preparation.rds"))
 ```
 
-# Final checks
+# Final checks and checkpoint inventory
 
 ```{r final-checks}
 stopifnot(
@@ -599,80 +935,65 @@ stopifnot(
   all(vapply(scenario_specs$path, length, integer(1)) == 2L),
   all(file.exists(unlist(scenario_specs$path, use.names = FALSE)))
 )
-
-manifest_audit <- tibble::tibble(
-  training_predictor_files = length(training_current_predictor_paths),
-  projection_current_predictor_files = length(
-    projection_current_predictor_paths
-  ),
-  scenarios = nrow(scenario_specs),
-  convertible_cells = convertible_cells,
-  convertible_area_km2 = convertible_area_km2,
-  climate_layers = terra::nlyr(current_climate),
-  complete_climate_cells = as.numeric(finite_climate_cells)
-)
-
-knitr::kable(manifest_audit, digits = 3)
+# Reopen the actual published files, not just the in-memory objects.
+check_published_pair <- function(paths) {
+  lu <- terra::rast(paths[[1]])
+  clim <- terra::rast(paths[[2]])
+  stopifnot(terra::compareGeom(lu, clim), identical(names(lu), "Landuse"),
+            identical(names(clim), climate_names))
+  rat <- levels(lu)[[1]]
+  stopifnot(is.data.frame(rat),
+            identical(as.integer(rat[[1]]), class_table$id),
+            identical(as.character(rat[[2]]), class_table$class))
+}
+check_published_pair(training_current_predictor_paths)
+check_published_pair(projection_current_predictor_paths)
+invisible(lapply(scenario_specs$path, check_published_pair))
+checkpoint_inventory <- do.call(rbind, lapply(
+  sort(ls(checkpoint_records)), function(stage) {
+    record <- get(stage, envir = checkpoint_records, inherits = FALSE)
+    data.frame(stage = stage, kind = record$kind, key = record$key,
+               path = record$path, bytes = sum(record$files$bytes))
+  }
+))
+knitr::kable(checkpoint_inventory[c("stage", "kind", "bytes")])
+write_small_output(checkpoint_inventory, file.path(
+  params$output_dir, "checkpoint_inventory.csv"), "csv")
+cat("Predictor preparation and all eight scenario audits passed.\n")
 ```
-
-# Use in the targets pipeline
-
-The existing climate pipeline uses one `Current_predictors` object for both
-model fitting and current projection. For this experiment it should be split:
-
-- `Training_current_predictors`: national land use + national current CHELSA;
-- `Projection_current_predictors`: gudenaa land use + gudenaa current
-  CHELSA; and
-- `Scenario_predictors`: the eight local scenario pairs.
-
-Point new file targets to the manifests:
-
-```r
-targets::tar_target(
-  Study_area_file,
-  "Datasets/greater_area_gudenaaen.shp",
-  format = "file"
-)
-
-targets::tar_target(
-  Training_predictor_manifest_file,
-  "Predictors/gudenaa_scenarios/training_current_predictor_paths_Denmark.rds",
-  format = "file"
-)
-
-targets::tar_target(
-  Projection_current_predictor_manifest_file,
-  "Predictors/gudenaa_scenarios/projection_current_predictor_paths_gudenaa.rds",
-  format = "file"
-)
-
-targets::tar_target(
-  Scenario_manifest_file,
-  "Predictors/gudenaa_scenarios/mixed_scenario_specs_gudenaa.rds",
-  format = "file"
-)
-```
-
-Use `Training_current_predictors` in `FitSpeciesModels()`. Thresholds must also
-be calibrated from national current predictions (or from an equivalent,
-validated occurrence-level calculation) before those thresholds are applied to
-the local current and scenario projections. This requires a small pipeline
-refactor; simply pointing the old `Current_predictor_manifest_file` at the local
-manifest would silently discard most occurrence records.
-
-Keep `categorical = "Landuse"`. Start the server run with 20--30 crew workers,
-one `terra`/BLAS thread per worker, and increase only after observing RAM, disk
-throughput and worker recycling. With the domain restricted to gudenaa, disk
-I/O is likely to become limiting before the available terabyte of RAM.
 
 # Plot current and one scenario
 
-```{r plot, fig.width=11, fig.height=6}
-example_scenario <- terra::rast(scenario_audit$landuse_path[[1]])
+The colour choices change the display only, not the stored class IDs.
 
+```{r plot, fig.width=11, fig.height=6}
+pal <- c(
+  ForestDryPoor = "#01665e", ForestWetPoor = "#35978f",
+  ForestDryRich = "#80cdc1", ForestWetRich = "#c7eae5",
+  OpenDryPoor = "#f6e8c3", OpenWetPoor = "#dfc27d",
+  OpenDryRich = "#bf812d", OpenWetRich = "#8c510a",
+  Agriculture = "#CC6677", Urban = "grey",
+  ProductionForest = "#80739B", Other = "white"
+)
 plot(
-  c(current_landuse, example_scenario),
-  type = "classes",
+  c(terra::rast(current_local_output_path),
+    terra::rast(scenario_audit$landuse_path[[1]])),
+  type = "classes", col = unname(pal[class_table$class]),
   main = c("Current", scenario_audit$scenario[[1]])
 )
 ```
+
+# Next: plant biodiversity
+
+Use targets_plant_biodiversity.R in the same project root. It has its own
+_targets_plant_biodiversity cache and Results/gudenaa_plant_biodiversity outputs;
+it does not use or modify _targets_climate or _targets_diversity_pilot.
+
+The modelling script calibrates thresholds and range weights from national
+baseline predictions, then applies the same fitted model, threshold and weight
+to all nine local conditions. National baseline binary rasters are saved for
+range-size estimation; **the biodiversity comparison maps are local**.
+
+Start with the input/selection checks and the 30-species pilot described at the
+top of that script. Do not launch the full national species list merely to
+check that the paths are correct.

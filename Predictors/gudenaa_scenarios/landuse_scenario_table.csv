@@ -1,0 +1,9 @@
+scenario,target_id,target_class
+all_to_forest_dry_poor,1,ForestDryPoor
+all_to_forest_wet_poor,2,ForestWetPoor
+all_to_forest_dry_rich,3,ForestDryRich
+all_to_forest_wet_rich,4,ForestWetRich
+all_to_open_dry_poor,5,OpenDryPoor
+all_to_open_wet_poor,6,OpenWetPoor
+all_to_open_dry_rich,7,OpenDryRich
+all_to_open_wet_rich,8,OpenWetRich

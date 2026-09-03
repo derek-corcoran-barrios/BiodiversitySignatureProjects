@@ -1,0 +1,9 @@
+scenario,target_id,target_class,changed_cells,expected_changed_cells,changed_area_km2,expected_changed_area_km2,changed_outside_convertible_cells,remaining_convertible_cells,wrong_destination_cells,missing_mask_changes,geometry_matches_current,landuse_path
+all_to_forest_dry_poor,1,ForestDryPoor,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_forest_dry_poor.tif
+all_to_forest_wet_poor,2,ForestWetPoor,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_forest_wet_poor.tif
+all_to_forest_dry_rich,3,ForestDryRich,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_forest_dry_rich.tif
+all_to_forest_wet_rich,4,ForestWetRich,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_forest_wet_rich.tif
+all_to_open_dry_poor,5,OpenDryPoor,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_open_dry_poor.tif
+all_to_open_wet_poor,6,OpenWetPoor,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_open_wet_poor.tif
+all_to_open_dry_rich,7,OpenDryRich,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_open_dry_rich.tif
+all_to_open_wet_rich,8,OpenWetRich,48027059,48027059,4806.05674999841,4806.05674999841,0,0,0,0,TRUE,Predictors/gudenaa_scenarios/landuse/Landuse_gudenaa_all_to_open_wet_rich.tif

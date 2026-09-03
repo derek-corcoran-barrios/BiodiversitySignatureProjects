@@ -65,3 +65,15 @@ ggplot() +
     na.value = "#00000000"
   ) +
   theme_dark()
+
+
+
+Landuse <- terra:::rast("Predictors/gudenaa_landuse/Landuse_Denmark_current.tif")
+
+Climate <- terra::rast("Predictors/Climate/chelsa_current_bio_DNK.tif")
+
+Climate <- terra::project(Climate, terra::crs(Landuse))
+
+SpeciesPoolR::write_cog(Climate, "Predictors/gudenaa_landuse/Landuse_Denmark_current.tif")
+
+
