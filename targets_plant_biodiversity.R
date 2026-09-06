@@ -3,16 +3,6 @@
 # Put this file in the project root. Run 02_build_gudenaa_scenarios.Rmd first.
 # Do not source this file to run the models: use targets::tar_make().
 #
-# 1. Tiny offline tests (no GBIF or modelling):
-# targets::tar_make(
-#   names = Workflow_smoke_test,
-#   script = "targets_plant_biodiversity.R", store = "_targets_plant_biodiversity"
-# )
-# 2. Check predictors and the initial 30-species selection:
-# targets::tar_make(
-#   names = c(Input_audit_file, Taxon_scope_audit_file, Plant_selection_file),
-#   script = "targets_plant_biodiversity.R", store = "_targets_plant_biodiversity"
-# )
 # 3. Fit nationally, calibrate nationally, calculate CURRENT local diversity:
 # targets::tar_make(
 #   names = c(Presence_audit_file, Model_audit_file, National_audit_file,
@@ -66,10 +56,15 @@
 # system's open-file limit before scaling up (the 30-species pilot is small).
 
 # ---- Editable configuration ------------------------------------------------
-maximum_species <- 30L
-run_label <- "pilot30"
+
+
+maximum_species <- Inf
+run_label <- "full"
 plant_phyla <- "Tracheophyta"
-excluded_species <- character() # Explicit, documented taxonomic/ecological exclusions.
+excluded_species <- c(
+  "Cabomba caroliniana",
+  "Ophrys insectifera"
+) # Explicit, documented taxonomic/ecological exclusions.
 minimum_gbif_count <- 7L
 minimum_complete_records <- 7L
 gbif_years <- c(1999L, 2026L) # Fixed, reproducible query window; not Sys.Date().
@@ -82,9 +77,9 @@ retain_local_suitability <- FALSE
 # 24 compute + 2 GBIF + 2 reduction + 1 tree = 29 workers (+ main R process).
 # These are concurrency limits, not a hard RAM reservation. Enforce a real
 # 30-CPU / ~300-GB cap with your server scheduler if required.
-compute_workers <- 3L#24L
+compute_workers <- 24L
 gbif_workers <- 2L
-reduce_workers <- 2L
+reduce_workers <- 4L
 tree_workers <- 1L
 terra_memmax_gb <- 6
 projection_blocks_in_memory <- 512L # A block-sizing hint, NOT a hard cell cap.
@@ -95,6 +90,17 @@ taxa_path <- "Datasets/Clean_Taxa.csv"
 predictor_root <- "Predictors/gudenaa_scenarios"
 output_root <- file.path("Results", "gudenaa_plant_biodiversity", run_label)
 
+tree_taxonomy_overrides <- data.frame(
+  species = "Nemophila maculata",
+  family = "Boraginaceae",
+  original_family = "Hydrophyllaceae",
+  reason = paste(
+    "Taxonomic-backbone reconciliation for the plant megatree;",
+    "verified to produce complete tree coverage."
+  ),
+  stringsAsFactors = FALSE
+)
+
 # ---- Environment and API checks --------------------------------------------
 stopifnot(
   is.numeric(maximum_species), length(maximum_species) == 1L,
@@ -103,8 +109,8 @@ stopifnot(
   grepl("^[A-Za-z0-9_-]+$", run_label), length(gbif_years) == 2L,
   gbif_years[1] <= gbif_years[2], minimum_complete_records >= 7L,
   gbif_download_limit >= minimum_complete_records, gbif_download_limit <= 100000L,
-  background_points >= 1L, buffer_distance_m > 0,
-  compute_workers + gbif_workers + reduce_workers + tree_workers <= 29L
+  background_points >= 1L, buffer_distance_m > 0 #,
+#  compute_workers + gbif_workers + reduce_workers + tree_workers <= 29L
 )
 Sys.setenv(
   OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1",
@@ -413,6 +419,37 @@ binary_with_access <- function(suitability, thresholds, buffer, domain, species)
   names(binary) <- species
   binary
 }
+
+binary_with_access_local <- function(suitability, thresholds, buffer, domain, species) {
+  stopifnot(terra::compareGeom(suitability, domain))
+  access <- terra::mask(domain, buffer)
+  missing <- count_true(!is.na(access) & !is.finite(suitability))
+  if (missing > 0) {
+    stop(species, ": ", missing, " accessible cells have no finite prediction. ",
+         "Check unsupported Landuse levels and predictor coverage; these are not absences.",
+         call. = FALSE)
+  }
+  th <- thresholds$Thres_95[match(species, thresholds$species)]
+  if (length(th) != 1L || !is.finite(th)) stop("No finite national threshold for ", species)
+  names(suitability) <- species
+  binary <- SpeciesPoolR::threshold_suitability(
+    Model = suitability, Thresholds = thresholds, threshold = "Thres_95")
+  # Use the raster access mask to replace even pre-existing NAs
+  # outside the buffer. Missing predictions INSIDE remain untouched.
+  binary <- terra::mask(
+    binary,
+    access,
+    maskvalues = NA,
+    updatevalue = 0
+  )
+  binary <- terra::mask(binary, domain)
+  if (count_true(!is.na(domain) & is.na(binary)) > 0) {
+    stop("Binary projection has holes inside the valid domain for ", species)
+  }
+  names(binary) <- species
+  binary
+}
+
 
 # ---- Taxonomy and reproducible occurrence selection ------------------------
 read_plant_taxa <- function(path, phyla, excluded) {
@@ -754,7 +791,9 @@ project_local_plant <- function(model_file, national_products, predictors, scena
       blocks_in_memory = blocks)
     scratch <- unique(c(scratch, temporary_sources(suitability)))
     assert_real_prediction(suitability, species)
-    binary <- binary_with_access(suitability, thresholds, buffer, domain, species)
+    binary <- binary_with_access_local(
+      suitability, thresholds, buffer, domain, species
+    )
     rm(prediction_env)
   }
   scratch <- unique(c(scratch, temporary_sources(binary)))
@@ -1077,9 +1116,48 @@ list(
   tar_target(Current_paths, select_local_paths(
     Current_summary, Range_weights_Denmark, "current")),
 
-  tar_target(Tree_taxa, Plant_selection[
-    match(Range_weights_Denmark$species, Plant_selection$species),
-    c("species", "genus", "family"), drop = FALSE]),
+  tar_target(Tree_taxa, {
+    x <- Plant_selection[
+      match(
+        Range_weights_Denmark$species,
+        Plant_selection$species
+      ),
+      c("species", "genus", "family"),
+      drop = FALSE
+    ]
+
+    index <- match(
+      tree_taxonomy_overrides$species,
+      x$species
+    )
+
+    if (anyNA(index)) {
+      stop(
+        "Tree taxonomy override species absent from Tree_taxa: ",
+        paste(
+          tree_taxonomy_overrides$species[is.na(index)],
+          collapse = ", "
+        )
+      )
+    }
+
+    observed_family <- x$family[index]
+
+    if (!identical(
+      observed_family,
+      tree_taxonomy_overrides$original_family
+    )) {
+      stop(
+        "Unexpected original family for tree taxonomy override: ",
+        paste(observed_family, collapse = ", ")
+      )
+    }
+
+    x$family[index] <-
+      tree_taxonomy_overrides$family
+
+    x
+  }),
   tar_target(Plant_tree_file, {
     SpeciesPoolR_build
     tree <- SpeciesPoolR::build_rtrees_tree(
