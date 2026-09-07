@@ -1,0 +1,56 @@
+# Small synthetic test of the patch-supernode contract.
+#
+# Two disconnected restoration networks are allowed. Each consists of one
+# 0.03 ha existing-nature patch plus two selected 0.01 ha cells, so each
+# reaches the deliberately tiny 0.05 ha demo threshold.
+#
+# Production runs should normally use MinPatchAreaHa := 5000.
+
+set Cells := 4 5 9 10;
+set MustIncludeCells := 4 9;
+
+set Landuses := ForestDryPoor OpenDryRich Ag;
+set NatureLanduses := ForestDryPoor OpenDryRich;
+
+# Each undirected candidate edge is supplied exactly once.
+set E :=
+    (4,5)
+    (9,10);
+
+set ExistingPatches := 101 102;
+
+set CellPatchEdges :=
+    (4,101)
+    (9,102);
+
+param ExistingPatchAreaHa :=
+    101 0.03
+    102 0.03;
+
+param BioDiversity default 0 :=
+    [ForestDryPoor, *] 4 0.9  5 0.7  9 0.2  10 0.1
+    [OpenDryRich, *]   4 0.3  5 0.5  9 0.9  10 0.8;
+
+param TransitionCost default 1 :=;
+
+# These sparse counts preserve the optional bonus for touching current nature
+# without retaining individual current-nature cells in the graph.
+param ExistingNatureContacts default 0 :=
+    ForestDryPoor 4 1
+    OpenDryRich   9 1;
+
+# Demonstrates use of pre-counted current area in final-area constraints.
+param ExistingLanduseAreaHa default 0 :=
+    ForestDryPoor 0.03
+    OpenDryRich   0.03;
+
+param MinFinalLanduseAreaHa default 0 :=
+    ForestDryPoor 0.05
+    OpenDryRich   0.05;
+
+param b := 4;
+param ExactBudget := 1;
+param MinLan := 0;
+param SpatialContiguityBonus := 0;
+param MinPatchAreaHa := 0.05;
+

@@ -1,0 +1,71 @@
+# Run in a disposable AMPL session from this folder:
+#   include FreeNoCarbon_demo.run;
+# Requires an installed/licensed AMPL interpreter and the HiGHS solver.
+# Change the solver line below if you use another MILP solver.
+# This script uses reset and synthetic data only. It writes no result files.
+
+reset;
+model FreeNoCarbon.mod;
+data FreeNoCarbon_demo.dat;
+option solver highs;
+
+printf "\nTEST 1: two separate qualifying networks are allowed.\n";
+solve;
+if solve_result_num >= 100 then {
+    printf "FAIL: expected a feasible optimum, got %s.\n", solve_result;
+    exit 1;
+}
+if abs(sum {l in Landuses, c in Cells}
+       LanduseDecision[l,c].val * BioDiversity[l,c] - 3.3) > 1e-6
+   or abs(sum {c in Cells} CollectedAreaHa[c].val - 0.10) > 1e-6
+   or abs(NetworkActive[11].val) > 1e-6
+   or abs(NetworkActive[12].val) > 1e-6
+   or abs(sum {l in Landuses} LanduseDecision[l,12].val) > 1e-6 then {
+    printf "FAIL: incorrect objective, area, or unavailable-cell selection.\n";
+    exit 1;
+}
+display ConservationIndex, LanduseDecision, NetworkRoot, CollectedAreaHa;
+
+printf "\nTEST 2: disconnected areas cannot be pooled.\n";
+# Total restored + existing area is ample, but neither five-cell component
+# reaches the new SIX-cell minimum. Cell 12 cannot act as a bridge.
+let MinPatchAreaHa := 0.06;
+solve;
+if solve_result_num < 200 or solve_result_num >= 300 then {
+    printf "FAIL: expected disconnected components to be infeasible.\n";
+    exit 1;
+}
+
+printf "\nTEST 3: an explicitly restored bridge joins the networks.\n";
+# Making the gap eligible is not enough: it must be selected and paid for.
+# With five restorable cells and exactly five units to spend, all five are
+# restored. They join seven existing cells into one twelve-cell component.
+let CanChange[12] := 1;
+let b := 5;
+let MinPatchAreaHa := 0.12;
+solve;
+if solve_result_num >= 100 then {
+    printf "FAIL: expected the restored bridge to make the problem feasible.\n";
+    exit 1;
+}
+if abs(sum {l in Landuses} LanduseDecision[l,12].val - 1) > 1e-6
+   or abs(sum {c in Cells} CollectedAreaHa[c].val - 0.12) > 1e-6 then {
+    printf "FAIL: bridge not selected or area incorrectly accumulated.\n";
+    exit 1;
+}
+
+printf "\nTEST 4: area cannot be counted twice.\n";
+let MinPatchAreaHa := 0.13;
+solve;
+if solve_result_num < 200 or solve_result_num >= 300 then {
+    printf "FAIL: the model counted more area than actually exists.\n";
+    exit 1;
+}
+
+printf "\nAll four synthetic connectivity tests passed.\n";
+printf "Production settings: 0.01 ha/cell and MinPatchAreaHa = 5000.\n";
+# Restore the first demonstration instance so its solution can be inspected.
+let CanChange[12] := 0;
+let b := 4;
+let MinPatchAreaHa := 0.05;
+solve;

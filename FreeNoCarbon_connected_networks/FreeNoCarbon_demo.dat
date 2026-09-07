@@ -1,0 +1,38 @@
+# SMALL SYNTHETIC TEST ONLY -- not a real planning-area dataset.
+# Twelve 10 x 10 m cells; threshold reduced to FIVE cells (0.05 ha).
+# Do NOT copy this reduced threshold into your production data.
+# The model's production default is MinPatchAreaHa = 5000.
+#
+# Two separate five-cell chains can each qualify. Both have three existing
+# nature cells and two restoration cells. Cell 11 is small existing nature
+# that need not qualify. Cell 12 is an unavailable/non-nature gap.
+
+set Cells := 1 2 3 4 5 6 7 8 9 10 11 12;
+set Landuses := ForestDryPoor OpenDryRich Ag;
+set NatureLanduses := ForestDryPoor OpenDryRich;
+set MustIncludeCells := 4 9;
+
+# Edge-sharing pairs. Listing each undirected edge once is sufficient for
+# the hard connectivity constraints; the reverse arcs are derived internally.
+set E :=
+    (1,2) (2,3) (3,4) (4,5)
+    (6,7) (7,8) (8,9) (9,10)
+    (5,12) (12,6) (11,12);
+
+param Existingnature :=
+    [ForestDryPoor, *] 1 1  3 1  7 1  11 1
+    [OpenDryRich, *]   2 1  6 1  8 1;
+
+param CanChange :=
+    1 0  2 0  3 0  4 1  5 1  6 0
+    7 0  8 0  9 1  10 1  11 0  12 0;
+
+param BioDiversity default 0 :=
+    [ForestDryPoor, *] 4 0.9  5 0.7  9 0.2  10 0.1
+    [OpenDryRich, *]   4 0.3  5 0.5  9 0.9  10 0.8;
+
+param TransitionCost default 1 :=;
+param b := 4;
+param MinLan := 0;
+param SpatialContiguityBonus := 0;
+param MinPatchAreaHa := 0.05;

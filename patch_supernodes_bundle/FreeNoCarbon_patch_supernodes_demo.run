@@ -1,0 +1,19 @@
+reset;
+
+model FreeNoCarbon_patch_supernodes.mod;
+data FreeNoCarbon_patch_supernodes_demo.dat;
+
+# Change this to your installed MIP solver if needed.
+option solver highs;
+solve;
+
+display ConservationIndex;
+display LanduseDecision;
+display PatchActive;
+display NetworkRoot;
+display CollectedAreaHa;
+
+# Expected optimum:
+#   ForestDryPoor at cells 4 and 5
+#   OpenDryRich   at cells 9 and 10
+# Both restoration-containing networks have 0.05 ha.
