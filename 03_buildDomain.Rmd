@@ -7,6 +7,9 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, error = FALSE, message = FALSE, warning = FALSE)
+GudenaaDomain <- terra::vect("Datasets/GudenaaDomain.shp")
+GudenaaLanduse <- terra::rast("Datasets/FinalLanduse.tif")
+
 ```
 
 ## Objective 
@@ -48,12 +51,239 @@ writeVector(GudenaaDomain, "Datasets/GudenaaDomain.shp")
 
 This area is a total of `r prettyNum(expanse(GudenaaDomain, unit = "ha"), big.mark = ",")`, We are aiming a at selecting for natural areas a total of 25,000 hectares which would be around `r round(25000/expanse(GudenaaDomain, unit = "ha")*100, 2)` percent of the total area. However of course not all cells are elegible, so first we will determine the total area of current nature, and the total area of selectable cells, in order to do that, we will crop and mask the greater landuse of Gudenna to the domain, and calculate the number of cells in those categoires
 
-```{r}
-GudenaaDomain <- terra::vect("Datasets/GudenaaDomain.shp")
+```{r, generateDomainLanduse, eval=FALSE}
 GudenaaLanduse <- terra::rast("Predictors/gudenaa_landuse/Landuse_Denmark_current.tif") |> 
   terra::project(terra::crs(GudenaaDomain), method = "near") |> 
   terra::crop(GudenaaDomain) |> 
   terra::mask(GudenaaDomain)
+
+SpeciesPoolR::write_cog(GudenaaLanduse, "Datasets/FinalLanduse.tif")
 ```
 
+
+Here we will calculate the amount of already natural area, and how much is elegible in hectares
+
+```{r elegiblecells, cache=TRUE}
+cell_area_m2 <- prod(terra::res(GudenaaLanduse))
+
+stopifnot(
+    abs(cell_area_m2 - 100) < 1e-8
+)
+
+landuse_summary <- terra::freq(GudenaaLanduse) |>
+    as.data.frame() |>
+    dplyr::mutate(
+        MajorCategory = dplyr::case_when(
+            value %in% c(
+                "ForestDryPoor", "ForestWetPoor",
+                "ForestDryRich", "ForestWetRich",
+                "OpenDryPoor", "OpenWetPoor",
+                "OpenDryRich", "OpenWetRich"
+            ) ~ "Nature",
+            value %in% c(
+                "Agriculture",
+                "ProductionForest"
+            ) ~ "Eligible",
+            TRUE ~ "Other"
+        )
+    ) |>
+    dplyr::group_by(MajorCategory) |>
+    dplyr::summarise(
+        cells = sum(count),
+        .groups = "drop"
+    ) |>
+    dplyr::mutate(
+        area_ha = cells * cell_area_m2 / 10000,
+        area_km2 = cells * cell_area_m2 / 1000000
+    )
+
+knitr::kable(landuse_summary, digits = 2)
+```
+
+Finally the elegible buget
+
+
+```{r budget, cache=TRUE}
+target_total_ha <- 25000
+
+target_total_cells <- ceiling(
+    target_total_ha * 10000 / cell_area_m2
+)
+
+nature_cells <- landuse_summary$cells[
+    landuse_summary$MajorCategory == "Nature"
+]
+
+eligible_cells <- landuse_summary$cells[
+    landuse_summary$MajorCategory == "Eligible"
+]
+
+new_cells_required <- target_total_cells - nature_cells
+
+budget_audit <- data.frame(
+    current_nature_cells = nature_cells,
+    current_nature_ha = nature_cells * cell_area_m2 / 10000,
+    eligible_cells = eligible_cells,
+    eligible_ha = eligible_cells * cell_area_m2 / 10000,
+    target_total_cells = target_total_cells,
+    target_total_ha = target_total_ha,
+    new_cells_required = new_cells_required,
+    new_area_required_ha =
+        new_cells_required * cell_area_m2 / 10000,
+    percent_of_eligible_required =
+        100 * new_cells_required / eligible_cells,
+    feasible_by_area =
+        new_cells_required <= eligible_cells
+)
+
+knitr::kable(budget_audit)
+```
+
+## Test agregation
+
+We might use the 200 meters as a hotstart
+
+```{r modal-landuse-200m}
+make_hierarchical_landuse <- function(
+    landuse,
+    target_resolution_m
+) {
+  
+  input_resolution <- terra::res(landuse)
+  
+  aggregation_factor <- as.integer(
+    round(target_resolution_m / input_resolution[1])
+  )
+  
+  stopifnot(
+    all(
+      abs(
+        input_resolution * aggregation_factor -
+          target_resolution_m
+      ) < 1e-6
+    )
+  )
+  
+  # Nature = 1; Eligible = 2; Other = 3
+  major_lookup <- cbind(
+    1:12,
+    c(
+      rep(1, 8),
+      2, # Agriculture
+      3, # Urban
+      2, # ProductionForest
+      3  # Other
+    )
+  )
+  
+  major_10m <- terra::classify(
+    landuse,
+    major_lookup
+  )
+  
+  # First choose the dominant major category.
+  major_coarse <- terra::aggregate(
+    major_10m,
+    fact = aggregation_factor,
+    fun = "modal",
+    na.rm = TRUE
+  )
+  
+  # Then choose the detailed class only within that category.
+  nature_only <- terra::ifel(
+    major_10m == 1,
+    landuse,
+    NA
+  )
+  
+  eligible_only <- terra::ifel(
+    major_10m == 2,
+    landuse,
+    NA
+  )
+  
+  other_only <- terra::ifel(
+    major_10m == 3,
+    landuse,
+    NA
+  )
+  
+  nature_coarse <- terra::aggregate(
+    nature_only,
+    fact = aggregation_factor,
+    fun = "modal",
+    na.rm = TRUE
+  )
+  
+  eligible_coarse <- terra::aggregate(
+    eligible_only,
+    fact = aggregation_factor,
+    fun = "modal",
+    na.rm = TRUE
+  )
+  
+  other_coarse <- terra::aggregate(
+    other_only,
+    fact = aggregation_factor,
+    fun = "modal",
+    na.rm = TRUE
+  )
+  
+  result <- terra::ifel(
+    major_coarse == 1,
+    nature_coarse,
+    terra::ifel(
+      major_coarse == 2,
+      eligible_coarse,
+      other_coarse
+    )
+  )
+  
+  levels(result) <- levels(landuse)
+  names(result) <- "Landuse"
+  
+  stopifnot(
+    all(
+      abs(
+        terra::res(result) -
+          target_resolution_m
+      ) < 1e-6
+    )
+  )
+  
+  result
+}
+
+GudenaaLanduse200_hierarchical <-
+  make_hierarchical_landuse(
+    GudenaaLanduse,
+    target_resolution_m = 200
+  )
+
+GudenaaLanduse100_hierarchical <-
+  make_hierarchical_landuse(
+    GudenaaLanduse,
+    target_resolution_m = 100
+  )
+
+terra::writeRaster(
+  GudenaaLanduse200_hierarchical,
+  file.path(
+    optimization_dir,
+    "Landuse_Gudenaa_200m_hierarchical.tif"
+  ),
+  overwrite = TRUE
+)
+
+terra::writeRaster(
+  GudenaaLanduse100_hierarchical,
+  file.path(
+    optimization_dir,
+    "Landuse_Gudenaa_100m_hierarchical.tif"
+  ),
+  overwrite = TRUE
+)
+
+freq(GudenaaLanduse200_modal)
+```
 
