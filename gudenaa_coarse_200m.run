@@ -1,0 +1,23 @@
+reset;
+
+model "FreeCarbon_coarse_patch_supernodes.mod";
+data "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m.dat";
+
+option solver gurobi;
+option gurobi_options 'lim:time=86400 mip:gap=0.01';
+solve;
+display solve_result_num, solve_result;
+
+printf "coarse_cell_id\tlanduse\trestored_ha\tbiodiversity\tpotential_carbon\n" > "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_selected_cells.tsv";
+printf {(l,c) in AllowedActions: LanduseDecision[l,c] > 0.5} "%d\t%s\t%.8f\t%.8f\t%.8f\n", c, l, RestorableAreaHa[c], BioDiversity[l,c], PotentialCarbon[l,c] >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_selected_cells.tsv";
+
+printf "patch_id\tfull_national_area_ha\n" > "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_active_patches.tsv";
+printf {p in ExistingPatches: PatchActive[p] > 0.5} "%d\t%.8f\n", p, ExistingPatchAreaHa[p] >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_active_patches.tsv";
+
+printf "item\tvalue\n" > "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "solve_result\t%s\n", solve_result >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "solve_result_num\t%d\n", solve_result_num >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "objective\t%.10f\n", ConservationIndex >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "restored_ha\t%.8f\n", sum {c in Cells} RestorableAreaHa[c] * Selected[c] >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "final_nature_ha\t%.8f\n", CurrentNatureAreaHa + sum {c in Cells} RestorableAreaHa[c] * Selected[c] >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
+printf "selected_cells\t%d\n", sum {c in Cells} Selected[c] >> "Optimization/gudenaa_coarse_200m/gudenaa_coarse_200m_solution_summary.tsv";
