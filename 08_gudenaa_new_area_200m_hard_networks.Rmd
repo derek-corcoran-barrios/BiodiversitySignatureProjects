@@ -1,0 +1,3015 @@
+---
+title: "New Gudenå area: anchored 200 m hard-network refinement"
+author: "Derek Corcoran"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Purpose and exact interpretation
+
+This is the second-stage 200 m optimization. It does not replace or overwrite
+the successful existing-adjacency warm-up. Instead, it reads that solution,
+turns it into a complete feasible MIP start, and adds the requested hard rules:
+
+1. current nature plus restoration is approximately 30% in **each** of the
+   four subareas (and therefore 30% in the complete polygon);
+2. at least one connected final-nature area contains 5,000 ha;
+3. each subarea has at least 1,000 ha of one connected final-nature area inside
+   that subarea;
+4. every certified area contains new restoration and has exactly one root in
+   an existing-nature patch;
+5. connecting several distinct existing-nature patches in the certified
+   5,000 ha network receives an additional normalized objective bonus; and
+6. a production-forest-dominated 200 m unit can receive only a forest-nature
+   destination.
+
+Network area means **current plus newly restored nature**. Habitat types may
+connect to each other; connectivity is not restricted to one habitat label.
+The five certificates may overlap, so one physical cross-boundary component
+may satisfy the global and several subarea requirements. This implements
+"at least one" without silently requiring five disjoint reserves.
+
+The hard optimization uses the established 200 m rook graph plus exact 10 m
+contacts to current-nature patch supernodes. After the solve, this notebook
+independently reconstructs final nature at 10 m and audits the same 5,000/1,000
+ha rules. A failed 10 m audit means the coarse solution needs a targeted 10 m
+refinement; it must not be reported as an exact fine-resolution network.
+
+# Packages
+
+```{r packages}
+library(terra)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(digest)
+library(igraph)
+library(knitr)
+```
+
+# Editable configuration
+
+Only this section should normally need editing.
+
+```{r configuration}
+# ---- Spatial inputs ------------------------------------------------------
+fine_landuse_path <- "Datasets/FinalLanduse.tif"
+coarse_landuse_path <- file.path(
+  "Predictors",
+  "gudenaa_optimization",
+  "Landuse_Gudenaa_200m_hierarchical.tif"
+)
+subareas_path <- file.path(
+  "Datasets",
+  "gudenaaplanen_afgreansning_15sep_delområder.shp"
+)
+
+subarea_label_field <- NULL
+expected_number_of_subareas <- 4L
+expected_subarea_areas_ha <- c(
+  7991.14551899414,
+  8653.25670292969,
+  13009.8300014893,
+  14526.539438208
+)
+expected_total_area_ha <- 44180.77
+polygon_area_audit_tolerance_ha <- 5
+
+# Needed to recreate exactly the biodiversity-supported eligibility mask used
+# by notebook 07.
+metrics_dir <- file.path(
+  "Results",
+  "gudenaa_plant_biodiversity",
+  "full",
+  "metrics"
+)
+biodiversity_support_metric <- "Richness"
+biodiversity_support_scenario <- "current"
+
+# ---- Upstream successful warm-up ----------------------------------------
+warmup_dir <- file.path(
+  "Optimization",
+  "gudenaa_new_area_200m_30pct_existing_adjacency"
+)
+warmup_name <- "gudenaa_new_area_200m_30pct_existing_adjacency"
+
+# ---- Policy --------------------------------------------------------------
+global_network_minimum_ha <- 5000
+subarea_network_minimum_ha <- 1000
+
+# Keep the same area tolerance and spatial weights used by the warm-up.
+spatial_contiguity_bonus <- 1
+new_to_new_adjacency_weight <- 0.5
+existing_to_new_adjacency_weight <- 0.5
+
+# Additional preference for joining several distinct existing-nature patches
+# inside the certified global network. This is a normalized soft reward, not a
+# hard requirement to connect a particular number of patches.
+connected_existing_patch_bonus <- 0.25
+
+# Established coarse rule: when at least half of a cell's eligible area is
+# ProductionForest, the entire 200 m decision receives a forest destination.
+production_forest_share_threshold <- 0.50
+
+# ---- Outputs and solver --------------------------------------------------
+problem_dir <- file.path(
+  "Optimization",
+  "gudenaa_new_area_200m_30pct_hard_networks"
+)
+problem_name <- "gudenaa_new_area_200m_30pct_hard_networks"
+model_path <- "Gudenaa_30pct_anchored_networks_200m.mod"
+
+solver_name <- "gurobi"
+solver_options <- paste(
+  "lim:time=21600",
+  "mip:gap=0.005",
+  "tech:outlev=1",
+  paste0(
+    "tech:logfile=",
+    file.path(problem_dir, paste0(problem_name, "_gurobi.log"))
+  ),
+  collapse = " "
+)
+
+reuse_matching_checkpoints <- TRUE
+```
+
+# Names and validation
+
+```{r names-and-validation}
+nature_landuses <- c(
+  "ForestDryPoor",
+  "ForestDryRich",
+  "ForestWetPoor",
+  "ForestWetRich",
+  "OpenDryPoor",
+  "OpenDryRich",
+  "OpenWetPoor",
+  "OpenWetRich"
+)
+forest_landuses <- c(
+  "ForestDryPoor",
+  "ForestDryRich",
+  "ForestWetPoor",
+  "ForestWetRich"
+)
+
+required_networks <- c(
+  "Global",
+  paste0("Subarea", seq_len(expected_number_of_subareas))
+)
+network_minimums <- c(
+  Global = global_network_minimum_ha,
+  stats::setNames(
+    rep(subarea_network_minimum_ha, expected_number_of_subareas),
+    paste0("Subarea", seq_len(expected_number_of_subareas))
+  )
+)
+
+stopifnot(
+  length(nature_landuses) == 8L,
+  length(forest_landuses) == 4L,
+  all(forest_landuses %in% nature_landuses),
+  global_network_minimum_ha > 0,
+  subarea_network_minimum_ha > 0,
+  spatial_contiguity_bonus >= 0,
+  connected_existing_patch_bonus >= 0,
+  new_to_new_adjacency_weight >= 0,
+  existing_to_new_adjacency_weight >= 0,
+  abs(
+    new_to_new_adjacency_weight +
+      existing_to_new_adjacency_weight - 1
+  ) < 1e-10,
+  production_forest_share_threshold > 0,
+  production_forest_share_threshold <= 1
+)
+```
+
+# Reusable helpers
+
+```{r helpers}
+shapefile_components <- function(path) {
+  if (tolower(tools::file_ext(path)) != "shp") return(path)
+  stem <- tools::file_path_sans_ext(path)
+  paste0(stem, c(".shp", ".shx", ".dbf", ".prj"))
+}
+
+stop_for_missing_files <- function(paths, description) {
+  paths <- unique(paths)
+  missing <- paths[!file.exists(paths)]
+  if (length(missing)) {
+    stop(
+      paste0(
+        "Missing ", description, ":\n- ",
+        paste(missing, collapse = "\n- ")
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(paths)
+}
+
+same_crs <- function(x, y) isTRUE(terra::same.crs(x, y))
+
+align_to_template <- function(x, template, method) {
+  if (!same_crs(x, template)) {
+    x <- terra::project(x, template, method = method)
+  } else if (!isTRUE(terra::compareGeom(
+    x,
+    template,
+    lyrs = FALSE,
+    stopOnError = FALSE
+  ))) {
+    x <- terra::resample(x, template, method = method)
+  }
+  terra::mask(x, template)
+}
+
+category_codes <- function(x, requested_labels) {
+  lev <- terra::levels(x)[[1]]
+  if (is.null(lev) || !nrow(lev)) {
+    stop("The fine land-use raster has no category table.", call. = FALSE)
+  }
+
+  numeric_columns <- names(lev)[vapply(lev, is.numeric, logical(1))]
+  label_columns <- names(lev)[vapply(
+    lev,
+    function(z) is.character(z) || is.factor(z),
+    logical(1)
+  )]
+  if (!length(numeric_columns) || !length(label_columns)) {
+    stop("Could not identify the land-use category columns.", call. = FALSE)
+  }
+
+  labels <- as.character(lev[[label_columns[[1]]]])
+  missing_labels <- setdiff(requested_labels, labels)
+  if (length(missing_labels)) {
+    stop(
+      "Missing land-use classes: ",
+      paste(missing_labels, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  stats::setNames(
+    lev[[numeric_columns[[1]]]][
+      match(requested_labels, labels)
+    ],
+    requested_labels
+  )
+}
+
+indicator_for_codes <- function(x, codes) {
+  terra::ifel(
+    is.na(x),
+    NA,
+    terra::ifel(x %in% codes, 1, 0)
+  )
+}
+
+zonal_sum_table <- function(x, zones, id_name) {
+  out <- terra::zonal(
+    x,
+    zones,
+    fun = "sum",
+    na.rm = TRUE,
+    wide = TRUE
+  ) |>
+    as.data.frame()
+  names(out)[1] <- id_name
+  out[[id_name]] <- as.numeric(out[[id_name]])
+  out
+}
+
+global_number <- function(x, fun) {
+  out <- if (fun %in% c("notNA", "isNA")) {
+    terra::global(x, fun)
+  } else {
+    terra::global(x, fun, na.rm = TRUE)
+  }
+  as.numeric(out[1, 1])
+}
+
+unwrap_checkpoint <- function(path) {
+  x <- readRDS(path)
+  if (is.list(x) && "value" %in% names(x)) x$value else x
+}
+
+file_fingerprint <- function(paths) {
+  paths <- normalizePath(paths, winslash = "/", mustWork = FALSE)
+  info <- file.info(paths)
+  tibble(path = paths, size = info$size, modified = as.numeric(info$mtime))
+}
+
+load_or_build_checkpoint <- function(
+    path,
+    signature,
+    builder,
+    required_sidecars = character()
+) {
+  if (
+    reuse_matching_checkpoints &&
+    file.exists(path) &&
+    all(file.exists(required_sidecars))
+  ) {
+    checkpoint <- readRDS(path)
+    if (
+      is.list(checkpoint) &&
+      identical(checkpoint$signature, signature) &&
+      !is.null(checkpoint$value)
+    ) {
+      return(checkpoint$value)
+    }
+  }
+  value <- builder()
+  saveRDS(list(signature = signature, value = value), path)
+  value
+}
+
+ampl_number <- function(x) {
+  format(x, scientific = FALSE, trim = TRUE, digits = 15)
+}
+
+append_dat <- function(path, lines) {
+  cat(
+    paste(lines, collapse = "\n"),
+    "\n",
+    file = path,
+    append = TRUE,
+    sep = ""
+  )
+}
+
+chunk_text <- function(x, chunk_size = 20L) {
+  if (!length(x)) return(character())
+  groups <- ceiling(seq_along(x) / chunk_size)
+  vapply(
+    split(x, groups),
+    paste,
+    collapse = " ",
+    FUN.VALUE = character(1)
+  )
+}
+
+write_ampl_set <- function(path, name, values) {
+  append_dat(
+    path,
+    c(paste("set", name, ":="), chunk_text(values), ";", "")
+  )
+}
+
+write_ampl_pair_set <- function(path, name, first, second) {
+  tuples <- paste0("(", first, ",", second, ")")
+  append_dat(
+    path,
+    c(
+      paste("set", name, ":="),
+      chunk_text(tuples, chunk_size = 8L),
+      ";",
+      ""
+    )
+  )
+}
+
+write_ampl_triple_set <- function(path, name, first, second, third) {
+  tuples <- paste0("(", first, ",", second, ",", third, ")")
+  append_dat(
+    path,
+    c(
+      paste("set", name, ":="),
+      chunk_text(tuples, chunk_size = 5L),
+      ";",
+      ""
+    )
+  )
+}
+
+write_ampl_scalar <- function(path, name, value) {
+  append_dat(
+    path,
+    c(paste0("param ", name, " := ", ampl_number(value), ";"), "")
+  )
+}
+
+write_ampl_vector <- function(path, name, key, value) {
+  rows <- paste(key, ampl_number(value))
+  append_dat(path, c(paste("param", name, ":="), rows, ";", ""))
+}
+
+write_ampl_matrix <- function(path, name, row_key, column_key, value) {
+  rows <- paste(row_key, column_key, ampl_number(value))
+  append_dat(path, c(paste("param", name, ":="), rows, ";", ""))
+}
+
+commit_generated_file <- function(temporary_path, final_path) {
+  unchanged <- file.exists(final_path) &&
+    unname(tools::md5sum(temporary_path)) ==
+      unname(tools::md5sum(final_path))
+  if (unchanged) {
+    unlink(temporary_path)
+    return(invisible(FALSE))
+  }
+  copied <- file.copy(temporary_path, final_path, overwrite = TRUE)
+  unlink(temporary_path)
+  if (!copied) stop("Could not write: ", final_path, call. = FALSE)
+  invisible(TRUE)
+}
+
+write_lines_if_changed <- function(lines, path) {
+  temporary_path <- paste0(path, ".building")
+  writeLines(lines, temporary_path)
+  commit_generated_file(temporary_path, path)
+}
+
+ampl_path <- function(path) chartr(intToUtf8(92L), "/", path)
+
+append_start <- function(path, lines) {
+  if (!length(lines)) return(invisible(NULL))
+  cat(
+    paste(lines, collapse = "\n"),
+    "\n",
+    file = path,
+    append = TRUE,
+    sep = ""
+  )
+}
+```
+
+# Read and validate the successful warm-up
+
+```{r read-upstream}
+dir.create(problem_dir, recursive = TRUE, showWarnings = FALSE)
+
+warmup_selected_path <- file.path(
+  warmup_dir,
+  paste0(warmup_name, "_selected_cells.tsv")
+)
+warmup_summary_path <- file.path(
+  warmup_dir,
+  paste0(warmup_name, "_solution_summary.tsv")
+)
+candidate_table_path <- file.path(
+  warmup_dir,
+  "candidate_cell_dictionary.csv"
+)
+candidate_subarea_path <- file.path(
+  warmup_dir,
+  "candidate_area_by_subarea.csv"
+)
+candidate_edges_path <- file.path(
+  warmup_dir,
+  "candidate_rook_edges.csv"
+)
+subarea_budget_path <- file.path(
+  warmup_dir,
+  "subarea_30pct_budget.csv"
+)
+existing_contact_path <- file.path(
+  warmup_dir,
+  "existing_nature_contact_by_action.csv"
+)
+biodiversity_checkpoint_path <- file.path(
+  warmup_dir,
+  "coarse_biodiversity_benefits.rds"
+)
+
+biodiversity_support_path <- file.path(
+  metrics_dir,
+  paste0(
+    biodiversity_support_metric,
+    "_",
+    biodiversity_support_scenario,
+    ".tif"
+  )
+)
+
+required_paths <- c(
+  fine_landuse_path,
+  coarse_landuse_path,
+  shapefile_components(subareas_path),
+  biodiversity_support_path,
+  model_path,
+  warmup_selected_path,
+  warmup_summary_path,
+  candidate_table_path,
+  candidate_subarea_path,
+  candidate_edges_path,
+  subarea_budget_path,
+  existing_contact_path,
+  biodiversity_checkpoint_path
+)
+stop_for_missing_files(required_paths, "hard-network input file(s)")
+
+warmup_summary <- readr::read_tsv(
+  warmup_summary_path,
+  show_col_types = FALSE,
+  col_types = cols(.default = col_character())
+)
+if (!any(str_detect(tolower(warmup_summary$value), "solved|optimal"))) {
+  stop(
+    "The upstream summary does not report a solved/optimal warm-up.",
+    call. = FALSE
+  )
+}
+
+warmup_selected <- readr::read_tsv(
+  warmup_selected_path,
+  show_col_types = FALSE
+) |>
+  transmute(
+    coarse_cell_id = as.integer(coarse_cell_id),
+    landuse = as.character(landuse)
+  )
+
+candidate_table <- readr::read_csv(
+  candidate_table_path,
+  show_col_types = FALSE
+) |>
+  mutate(
+    coarse_cell_id = as.integer(coarse_cell_id),
+    ProductionForestShare = if_else(
+      EligibleAreaHa > 0,
+      ProductionForestHa / EligibleAreaHa,
+      0
+    ),
+    IsProductionForestCell = as.integer(
+      ProductionForestShare >= production_forest_share_threshold
+    )
+  ) |>
+  filter(IsCandidate) |>
+  arrange(coarse_cell_id)
+
+candidate_cells <- candidate_table$coarse_cell_id
+
+restorable_area_by_subarea_cell <- readr::read_csv(
+  candidate_subarea_path,
+  show_col_types = FALSE
+) |>
+  transmute(
+    subarea_id = as.integer(subarea_id),
+    coarse_cell_id = as.integer(coarse_cell_id),
+    RestorableAreaHaBySubarea = as.numeric(
+      RestorableAreaHaBySubarea
+    )
+  ) |>
+  filter(coarse_cell_id %in% candidate_cells)
+
+candidate_edges <- readr::read_csv(
+  candidate_edges_path,
+  show_col_types = FALSE
+) |>
+  transmute(i = as.integer(i), j = as.integer(j)) |>
+  filter(i %in% candidate_cells, j %in% candidate_cells) |>
+  distinct() |>
+  arrange(i, j)
+
+subarea_budget <- readr::read_csv(
+  subarea_budget_path,
+  show_col_types = FALSE
+) |>
+  mutate(subarea_id = as.integer(subarea_id)) |>
+  arrange(subarea_id)
+
+existing_nature_contact <- readr::read_csv(
+  existing_contact_path,
+  show_col_types = FALSE
+) |>
+  transmute(
+    landuse = as.character(landuse),
+    coarse_cell_id = as.integer(coarse_cell_id),
+    ExistingNatureContact = as.numeric(ExistingNatureContact)
+  ) |>
+  filter(coarse_cell_id %in% candidate_cells)
+
+biodiversity_checkpoint <- unwrap_checkpoint(
+  biodiversity_checkpoint_path
+)
+if (
+  !is.list(biodiversity_checkpoint) ||
+  !"benefits" %in% names(biodiversity_checkpoint)
+) {
+  stop("Unexpected biodiversity checkpoint structure.", call. = FALSE)
+}
+biodiversity_table <- biodiversity_checkpoint$benefits |>
+  transmute(
+    coarse_cell_id = as.integer(coarse_cell_id),
+    landuse = as.character(landuse),
+    BioDiversity = as.numeric(BioDiversity)
+  ) |>
+  filter(coarse_cell_id %in% candidate_cells)
+
+stopifnot(
+  nrow(subarea_budget) == expected_number_of_subareas,
+  nrow(warmup_selected) > 0L,
+  !anyDuplicated(warmup_selected$coarse_cell_id),
+  all(warmup_selected$coarse_cell_id %in% candidate_cells),
+  all(warmup_selected$landuse %in% nature_landuses),
+  length(candidate_cells) > 0L,
+  nrow(candidate_edges) > 0L,
+  nrow(biodiversity_table) ==
+    length(candidate_cells) * length(nature_landuses),
+  nrow(existing_nature_contact) ==
+    length(candidate_cells) * length(nature_landuses),
+  !anyNA(biodiversity_table),
+  !anyNA(existing_nature_contact)
+)
+
+input_audit <- file_fingerprint(required_paths)
+readr::write_csv(
+  input_audit,
+  file.path(problem_dir, "input_file_audit.csv")
+)
+knitr::kable(input_audit)
+```
+
+# Reconstruct the aligned 10 m and 200 m domain
+
+```{r aligned-domain}
+fine_landuse_full <- terra::rast(fine_landuse_path)
+coarse_landuse_full <- terra::rast(coarse_landuse_path)
+
+stopifnot(
+  terra::nlyr(fine_landuse_full) == 1L,
+  terra::nlyr(coarse_landuse_full) == 1L,
+  all(abs(terra::res(fine_landuse_full) - 10) < 1e-8),
+  all(abs(terra::res(coarse_landuse_full) - 200) < 1e-8),
+  same_crs(fine_landuse_full, coarse_landuse_full)
+)
+
+fine_cell_area_ha <- prod(terra::res(fine_landuse_full)) / 10000
+
+subareas <- terra::vect(subareas_path) |>
+  terra::makeValid()
+if (nrow(subareas) != expected_number_of_subareas) {
+  stop(
+    "Expected four subareas; found ", nrow(subareas), ".",
+    call. = FALSE
+  )
+}
+if (!same_crs(subareas, fine_landuse_full)) {
+  subareas <- terra::project(subareas, terra::crs(fine_landuse_full))
+}
+
+if (is.null(subarea_label_field)) {
+  subarea_labels <- paste0("subarea_", seq_len(nrow(subareas)))
+} else {
+  if (!subarea_label_field %in% names(subareas)) {
+    stop("Invalid subarea_label_field.", call. = FALSE)
+  }
+  subarea_labels <- make.unique(as.character(
+    as.data.frame(subareas)[[subarea_label_field]]
+  ))
+}
+
+subareas$subarea_id <- seq_len(nrow(subareas))
+subareas$subarea_label <- subarea_labels
+polygon_areas_ha <- as.numeric(
+  terra::expanse(subareas, unit = "ha", transform = FALSE)
+)
+planning_domain <- terra::aggregate(subareas)
+
+if (
+  any(
+    abs(sort(polygon_areas_ha) - sort(expected_subarea_areas_ha)) >
+      polygon_area_audit_tolerance_ha
+  ) ||
+  abs(sum(polygon_areas_ha) - expected_total_area_ha) >
+    polygon_area_audit_tolerance_ha
+) {
+  stop(
+    "The polygon areas do not match the intended smaller Gudenå polygon.",
+    call. = FALSE
+  )
+}
+
+fine_landuse <- terra::crop(
+  fine_landuse_full,
+  planning_domain,
+  snap = "out"
+) |>
+  terra::mask(planning_domain, touches = FALSE)
+
+coarse_landuse <- terra::crop(
+  coarse_landuse_full,
+  planning_domain,
+  snap = "out"
+) |>
+  terra::mask(planning_domain, touches = TRUE)
+
+coarse_cell_id <- terra::init(coarse_landuse, "cell")
+coarse_cell_id <- terra::ifel(
+  is.na(coarse_landuse),
+  NA,
+  coarse_cell_id
+)
+names(coarse_cell_id) <- "coarse_cell_id"
+
+coarse_id_on_fine <- align_to_template(
+  coarse_cell_id,
+  fine_landuse,
+  method = "near"
+)
+names(coarse_id_on_fine) <- "coarse_cell_id"
+
+subarea_id_on_fine <- terra::rasterize(
+  subareas[, "subarea_id"],
+  fine_landuse,
+  field = "subarea_id",
+  background = NA,
+  touches = FALSE
+)
+subarea_id_on_fine <- terra::mask(
+  subarea_id_on_fine,
+  fine_landuse
+)
+names(subarea_id_on_fine) <- "subarea_id"
+
+all_required_classes <- c(
+  nature_landuses,
+  "Agriculture",
+  "ProductionForest",
+  "Urban",
+  "Other"
+)
+landuse_codes <- category_codes(fine_landuse, all_required_classes)
+nature_codes <- unname(landuse_codes[nature_landuses])
+eligible_codes <- unname(
+  landuse_codes[c("Agriculture", "ProductionForest")]
+)
+
+fine_nature <- indicator_for_codes(fine_landuse, nature_codes)
+names(fine_nature) <- "CurrentNatureCells"
+
+biodiversity_support <- terra::rast(biodiversity_support_path)
+biodiversity_support <- align_to_template(
+  biodiversity_support,
+  fine_landuse,
+  method = "bilinear"
+)
+fine_biodiversity_support <- terra::ifel(
+  is.na(fine_landuse),
+  NA,
+  terra::ifel(!is.na(biodiversity_support), 1, 0)
+)
+
+fine_eligible <-
+  indicator_for_codes(fine_landuse, eligible_codes) *
+  fine_biodiversity_support
+fine_eligible_mask <- terra::ifel(fine_eligible == 1, 1, NA)
+names(fine_eligible_mask) <- "EligibleCells"
+
+candidate_mask_on_fine <- terra::ifel(
+  coarse_id_on_fine %in% candidate_cells,
+  1,
+  NA
+)
+fine_candidate_eligible_mask <- terra::mask(
+  fine_eligible_mask,
+  candidate_mask_on_fine
+)
+
+if (
+  global_number(
+    terra::ifel(
+      !is.na(fine_landuse) & is.na(coarse_id_on_fine),
+      1,
+      0
+    ),
+    "sum"
+  ) > 0
+) {
+  stop("Some valid 10 m cells have no 200 m ID.", call. = FALSE)
+}
+
+coarse_ids_reconstructed <- sort(unique(na.omit(as.integer(
+  terra::values(coarse_cell_id, mat = FALSE)
+))))
+if (!all(candidate_cells %in% coarse_ids_reconstructed)) {
+  stop(
+    "Reconstructed coarse IDs do not match notebook 07 outputs.",
+    call. = FALSE
+  )
+}
+```
+
+# Current-nature patches and candidate contacts
+
+Current nature is binarized across all eight nature types and split into exact
+10 m rook-connected patches. Each retained patch becomes one graph supernode.
+
+```{r patch-network}
+patch_raster_path <- file.path(
+  problem_dir,
+  "current_nature_patches_10m.tif"
+)
+
+patch_signature <- digest::digest(list(
+  files = file_fingerprint(c(
+    fine_landuse_path,
+    coarse_landuse_path,
+    shapefile_components(subareas_path),
+    biodiversity_support_path,
+    candidate_table_path,
+    candidate_edges_path
+  )),
+  candidate_cells = candidate_cells,
+  directions = 4L,
+  fine_resolution = terra::res(fine_landuse)
+))
+
+patch_network <- load_or_build_checkpoint(
+  file.path(problem_dir, "existing_patch_network.rds"),
+  patch_signature,
+  function() {
+    current_patch_raster <- terra::patches(
+      fine_nature,
+      directions = 4,
+      zeroAsNA = TRUE
+    )
+    names(current_patch_raster) <- "patch_id"
+    terra::writeRaster(
+      current_patch_raster,
+      patch_raster_path,
+      overwrite = TRUE,
+      datatype = "INT4U",
+      gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=YES")
+    )
+
+    patch_table_all <- zonal_sum_table(
+      fine_nature,
+      current_patch_raster,
+      "patch_id"
+    ) |>
+      transmute(
+        patch_id = as.integer(round(patch_id)),
+        ExistingPatchAreaHa =
+          CurrentNatureCells * fine_cell_area_ha
+      )
+
+    eligible_indices <- which(!is.na(terra::values(
+      fine_candidate_eligible_mask,
+      mat = FALSE
+    )))
+    if (!length(eligible_indices)) {
+      stop("No fine candidate cells are available.", call. = FALSE)
+    }
+
+    adjacent_pairs <- terra::adjacent(
+      fine_landuse,
+      cells = eligible_indices,
+      directions = 4,
+      pairs = TRUE,
+      include = FALSE
+    ) |>
+      as.matrix()
+
+    patch_values <- terra::values(
+      current_patch_raster,
+      mat = FALSE
+    )
+    coarse_values <- terra::values(coarse_id_on_fine, mat = FALSE)
+
+    cell_patch_links <- tibble(
+      coarse_cell_id = as.integer(
+        round(coarse_values[adjacent_pairs[, 1]])
+      ),
+      patch_id = as.integer(
+        round(patch_values[adjacent_pairs[, 2]])
+      )
+    ) |>
+      filter(
+        !is.na(coarse_cell_id),
+        !is.na(patch_id),
+        coarse_cell_id %in% candidate_cells
+      ) |>
+      distinct() |>
+      arrange(coarse_cell_id, patch_id)
+
+    retained_patch_ids <- sort(unique(cell_patch_links$patch_id))
+    patch_table <- patch_table_all |>
+      filter(patch_id %in% retained_patch_ids) |>
+      arrange(patch_id)
+
+    pair_multiplier <- expected_number_of_subareas + 1L
+    patch_subarea_zone <- terra::ifel(
+      is.na(current_patch_raster) | is.na(subarea_id_on_fine),
+      NA,
+      current_patch_raster * pair_multiplier +
+        subarea_id_on_fine
+    )
+
+    patch_area_by_subarea <- zonal_sum_table(
+      fine_nature,
+      patch_subarea_zone,
+      "pair_id"
+    ) |>
+      mutate(
+        patch_id = as.integer(floor(pair_id / pair_multiplier)),
+        subarea_id = as.integer(
+          round(pair_id - patch_id * pair_multiplier)
+        ),
+        ExistingPatchAreaHaBySubarea =
+          CurrentNatureCells * fine_cell_area_ha
+      ) |>
+      filter(
+        patch_id %in% retained_patch_ids,
+        subarea_id %in% seq_len(expected_number_of_subareas),
+        ExistingPatchAreaHaBySubarea > 0
+      ) |>
+      select(
+        patch_id,
+        subarea_id,
+        ExistingPatchAreaHaBySubarea
+      ) |>
+      arrange(subarea_id, patch_id)
+
+    list(
+      patches = patch_table,
+      patch_area_by_subarea = patch_area_by_subarea,
+      links = cell_patch_links
+    )
+  },
+  required_sidecars = patch_raster_path
+)
+
+current_patch_raster <- terra::rast(patch_raster_path)
+patch_table <- patch_network$patches
+patch_area_by_subarea <- patch_network$patch_area_by_subarea
+cell_patch_links <- patch_network$links
+existing_patches <- patch_table$patch_id
+
+stopifnot(
+  nrow(patch_table) > 0L,
+  nrow(cell_patch_links) > 0L,
+  all(cell_patch_links$coarse_cell_id %in% candidate_cells),
+  all(cell_patch_links$patch_id %in% existing_patches),
+  all(patch_table$ExistingPatchAreaHa > 0),
+  !anyDuplicated(patch_table$patch_id),
+  !anyDuplicated(cell_patch_links)
+)
+
+patch_area_crosscheck <- patch_area_by_subarea |>
+  group_by(patch_id) |>
+  summarise(
+    SplitAreaHa = sum(ExistingPatchAreaHaBySubarea),
+    .groups = "drop"
+  ) |>
+  right_join(patch_table, by = "patch_id")
+
+if (
+  anyNA(patch_area_crosscheck$SplitAreaHa) ||
+  any(abs(
+    patch_area_crosscheck$SplitAreaHa -
+      patch_area_crosscheck$ExistingPatchAreaHa
+  ) > fine_cell_area_ha + 1e-8)
+) {
+  stop("Patch areas do not reconcile by subarea.", call. = FALSE)
+}
+
+readr::write_csv(
+  patch_table,
+  file.path(problem_dir, "existing_patch_dictionary.csv")
+)
+readr::write_csv(
+  patch_area_by_subarea,
+  file.path(problem_dir, "existing_patch_area_by_subarea.csv")
+)
+readr::write_csv(
+  cell_patch_links,
+  file.path(problem_dir, "candidate_to_existing_patch_links.csv")
+)
+
+knitr::kable(tibble(
+  retained_existing_patches = nrow(patch_table),
+  current_nature_ha_in_retained_patches =
+    sum(patch_table$ExistingPatchAreaHa),
+  candidate_patch_contacts = nrow(cell_patch_links),
+  candidate_cells_touching_current_nature =
+    n_distinct(cell_patch_links$coarse_cell_id)
+), digits = 2)
+```
+
+# Potential graph and tight flow bounds
+
+```{r potential-graph}
+potential_vertices <- bind_rows(
+  candidate_table |>
+    transmute(
+      vertex = paste0("c_", coarse_cell_id),
+      node_type = "cell",
+      node_id = coarse_cell_id,
+      FlowAreaHa = EligibleAreaHa
+    ),
+  patch_table |>
+    transmute(
+      vertex = paste0("p_", patch_id),
+      node_type = "patch",
+      node_id = patch_id,
+      FlowAreaHa = ExistingPatchAreaHa
+    )
+)
+
+potential_edges <- bind_rows(
+  candidate_edges |>
+    transmute(from = paste0("c_", i), to = paste0("c_", j)),
+  cell_patch_links |>
+    transmute(
+      from = paste0("c_", coarse_cell_id),
+      to = paste0("p_", patch_id)
+    )
+) |>
+  distinct()
+
+potential_graph <- igraph::graph_from_data_frame(
+  potential_edges,
+  directed = FALSE,
+  vertices = potential_vertices
+)
+potential_membership_raw <- igraph::components(
+  potential_graph
+)$membership
+potential_membership <- tibble(
+  vertex = names(potential_membership_raw),
+  potential_component = as.integer(potential_membership_raw)
+)
+
+potential_vertices <- potential_vertices |>
+  left_join(potential_membership, by = "vertex")
+
+potential_component_summary <- potential_vertices |>
+  group_by(potential_component) |>
+  summarise(
+    ComponentMaxAreaHa = sum(FlowAreaHa),
+    candidate_cells = sum(node_type == "cell"),
+    existing_patches = sum(node_type == "patch"),
+    .groups = "drop"
+  )
+
+cell_component_bounds <- potential_vertices |>
+  filter(node_type == "cell") |>
+  select(coarse_cell_id = node_id, potential_component) |>
+  left_join(potential_component_summary, by = "potential_component") |>
+  select(coarse_cell_id, ComponentMaxAreaHa)
+
+patch_component_bounds <- potential_vertices |>
+  filter(node_type == "patch") |>
+  select(patch_id = node_id, potential_component) |>
+  left_join(potential_component_summary, by = "potential_component") |>
+  select(patch_id, ComponentMaxAreaHa)
+
+# Area coefficients for the Global and four Subarea certificates.
+network_cell_area <- bind_rows(
+  candidate_table |>
+    transmute(
+      network_name = "Global",
+      coarse_cell_id,
+      NetworkCellAreaHa = EligibleAreaHa
+    ),
+  restorable_area_by_subarea_cell |>
+    transmute(
+      network_name = paste0("Subarea", subarea_id),
+      coarse_cell_id,
+      NetworkCellAreaHa = RestorableAreaHaBySubarea
+    )
+) |>
+  filter(NetworkCellAreaHa > 0)
+
+network_patch_area <- bind_rows(
+  patch_table |>
+    transmute(
+      network_name = "Global",
+      patch_id,
+      NetworkPatchAreaHa = ExistingPatchAreaHa
+    ),
+  patch_area_by_subarea |>
+    transmute(
+      network_name = paste0("Subarea", subarea_id),
+      patch_id,
+      NetworkPatchAreaHa = ExistingPatchAreaHaBySubarea
+    )
+) |>
+  filter(NetworkPatchAreaHa > 0)
+
+potential_component_network_area <- bind_rows(
+  network_cell_area |>
+    left_join(
+      potential_vertices |>
+        filter(node_type == "cell") |>
+        transmute(
+          coarse_cell_id = node_id,
+          potential_component
+        ),
+      by = "coarse_cell_id"
+    ) |>
+    transmute(
+      network_name,
+      potential_component,
+      CertificateAreaHa = NetworkCellAreaHa
+    ),
+  network_patch_area |>
+    left_join(
+      potential_vertices |>
+        filter(node_type == "patch") |>
+        transmute(patch_id = node_id, potential_component),
+      by = "patch_id"
+    ) |>
+    transmute(
+      network_name,
+      potential_component,
+      CertificateAreaHa = NetworkPatchAreaHa
+    )
+) |>
+  group_by(network_name, potential_component) |>
+  summarise(
+    PotentialCertificateAreaHa = sum(CertificateAreaHa),
+    .groups = "drop"
+  ) |>
+  left_join(
+    potential_component_summary,
+    by = "potential_component"
+  ) |>
+  mutate(
+    RequiredAreaHa = unname(network_minimums[network_name]),
+    CanAnchor = candidate_cells > 0 & existing_patches > 0,
+    PassesPotentialArea =
+      PotentialCertificateAreaHa >= RequiredAreaHa - 1e-8,
+    FeasiblePotentialComponent = CanAnchor & PassesPotentialArea
+  )
+
+potential_network_audit <- tibble(
+  network_name = required_networks,
+  RequiredAreaHa = unname(network_minimums[required_networks])
+) |>
+  left_join(
+    potential_component_network_area |>
+      group_by(network_name) |>
+      summarise(
+        RequiredAreaHa = first(RequiredAreaHa),
+        feasible_potential_components =
+          sum(FeasiblePotentialComponent),
+        largest_potential_certificate_ha = max(
+          PotentialCertificateAreaHa[CanAnchor],
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      ),
+    by = c("network_name", "RequiredAreaHa")
+  )
+
+if (
+  anyNA(potential_network_audit$feasible_potential_components) ||
+  any(potential_network_audit$feasible_potential_components < 1L)
+) {
+  stop(
+    "At least one requested network is impossible in the potential graph. ",
+    "Inspect potential_network_feasibility_audit.csv.",
+    call. = FALSE
+  )
+}
+
+patch_connection_normalizer <- max(
+  1,
+  max(potential_component_summary$existing_patches) - 1
+)
+
+readr::write_csv(
+  potential_component_summary,
+  file.path(problem_dir, "potential_graph_components.csv")
+)
+readr::write_csv(
+  potential_component_network_area,
+  file.path(problem_dir, "potential_component_network_area.csv")
+)
+readr::write_csv(
+  potential_network_audit,
+  file.path(problem_dir, "potential_network_feasibility_audit.csv")
+)
+
+knitr::kable(potential_network_audit, digits = 2)
+```
+
+# Feasible actions and warm-up label repair
+
+The selected **footprint** from notebook 07 is preserved in the MIP start.
+Only a destination label is repaired when a production-forest-dominated cell
+was assigned an open habitat in the simplified warm-up.
+
+```{r model-actions}
+allowed_actions <- tidyr::crossing(
+  landuse = nature_landuses,
+  candidate_table |>
+    select(coarse_cell_id, IsProductionForestCell)
+) |>
+  filter(
+    IsProductionForestCell == 0 |
+      landuse %in% forest_landuses
+  ) |>
+  select(landuse, coarse_cell_id) |>
+  arrange(landuse, coarse_cell_id)
+
+objective_table <- allowed_actions |>
+  left_join(
+    biodiversity_table,
+    by = c("landuse", "coarse_cell_id")
+  ) |>
+  left_join(
+    existing_nature_contact,
+    by = c("landuse", "coarse_cell_id")
+  )
+
+stopifnot(
+  n_distinct(allowed_actions$coarse_cell_id) ==
+    length(candidate_cells),
+  !anyDuplicated(allowed_actions),
+  !anyNA(objective_table),
+  all(is.finite(objective_table$BioDiversity)),
+  all(is.finite(objective_table$ExistingNatureContact))
+)
+
+biodiversity_normalizer <- objective_table |>
+  group_by(coarse_cell_id) |>
+  summarise(best = max(BioDiversity), .groups = "drop") |>
+  summarise(total = sum(best)) |>
+  pull(total) |>
+  max(1)
+
+contiguity_normalizer <- max(1, nrow(candidate_edges))
+
+existing_nature_contact_normalizer <- objective_table |>
+  group_by(coarse_cell_id) |>
+  summarise(
+    best = max(ExistingNatureContact),
+    .groups = "drop"
+  ) |>
+  summarise(total = sum(best)) |>
+  pull(total) |>
+  max(1)
+
+allowed_i <- allowed_actions |>
+  transmute(landuse, i = coarse_cell_id)
+allowed_j <- allowed_actions |>
+  transmute(landuse, j = coarse_cell_id)
+
+same_habitat_edges <- tidyr::crossing(
+  landuse = nature_landuses,
+  candidate_edges
+) |>
+  semi_join(allowed_i, by = c("landuse", "i")) |>
+  semi_join(allowed_j, by = c("landuse", "j")) |>
+  arrange(landuse, i, j)
+
+best_forest_action <- objective_table |>
+  filter(landuse %in% forest_landuses) |>
+  mutate(
+    local_start_score =
+      BioDiversity / biodiversity_normalizer +
+      spatial_contiguity_bonus *
+        existing_to_new_adjacency_weight *
+        ExistingNatureContact /
+          existing_nature_contact_normalizer
+  ) |>
+  group_by(coarse_cell_id) |>
+  arrange(
+    desc(local_start_score),
+    desc(BioDiversity),
+    landuse,
+    .by_group = TRUE
+  ) |>
+  slice_head(n = 1L) |>
+  ungroup() |>
+  select(
+    coarse_cell_id,
+    repaired_forest_landuse = landuse
+  )
+
+warm_start_assignment <- warmup_selected |>
+  rename(original_landuse = landuse) |>
+  left_join(
+    candidate_table |>
+      select(coarse_cell_id, IsProductionForestCell),
+    by = "coarse_cell_id"
+  ) |>
+  left_join(best_forest_action, by = "coarse_cell_id") |>
+  mutate(
+    forest_rule_repair =
+      IsProductionForestCell == 1L &
+      !original_landuse %in% forest_landuses,
+    landuse = if_else(
+      forest_rule_repair,
+      repaired_forest_landuse,
+      original_landuse
+    )
+  ) |>
+  select(
+    coarse_cell_id,
+    original_landuse,
+    landuse,
+    IsProductionForestCell,
+    forest_rule_repair
+  ) |>
+  arrange(coarse_cell_id)
+
+invalid_start_actions <- warm_start_assignment |>
+  anti_join(
+    allowed_actions,
+    by = c("landuse", "coarse_cell_id")
+  )
+if (nrow(invalid_start_actions)) {
+  stop("Warm-start action repair failed.", call. = FALSE)
+}
+
+warm_start_area_audit <- restorable_area_by_subarea_cell |>
+  filter(
+    coarse_cell_id %in% warm_start_assignment$coarse_cell_id
+  ) |>
+  group_by(subarea_id) |>
+  summarise(
+    WarmStartRestorationHa = sum(RestorableAreaHaBySubarea),
+    .groups = "drop"
+  ) |>
+  right_join(subarea_budget, by = "subarea_id") |>
+  mutate(
+    WarmStartRestorationHa = coalesce(WarmStartRestorationHa, 0),
+    PassesLower =
+      WarmStartRestorationHa >= RestorationRequirementHa - 1e-6,
+    PassesUpper =
+      WarmStartRestorationHa <=
+        RestorationRequirementHa + RestorationToleranceHa + 1e-6
+  ) |>
+  arrange(subarea_id)
+
+if (!all(
+  warm_start_area_audit$PassesLower &
+    warm_start_area_audit$PassesUpper
+)) {
+  stop(
+    "The upstream footprint does not satisfy the unchanged 30% bounds.",
+    call. = FALSE
+  )
+}
+
+readr::write_csv(
+  warm_start_assignment,
+  file.path(problem_dir, "warm_start_assignment_and_forest_repairs.csv")
+)
+readr::write_csv(
+  warm_start_area_audit,
+  file.path(problem_dir, "warm_start_30pct_audit.csv")
+)
+
+knitr::kable(tibble(
+  warm_start_selected_cells = nrow(warm_start_assignment),
+  production_forest_dominated_selected_cells = sum(
+    warm_start_assignment$IsProductionForestCell == 1L
+  ),
+  destination_labels_repaired = sum(
+    warm_start_assignment$forest_rule_repair
+  )
+))
+```
+
+# Find feasible certificate components in the warm-up solution
+
+```{r warm-start-components}
+warm_start_ids <- warm_start_assignment$coarse_cell_id
+warm_start_patch_ids <- cell_patch_links |>
+  filter(coarse_cell_id %in% warm_start_ids) |>
+  distinct(patch_id) |>
+  pull(patch_id) |>
+  sort()
+
+warm_start_vertices <- bind_rows(
+  candidate_table |>
+    filter(coarse_cell_id %in% warm_start_ids) |>
+    transmute(
+      vertex = paste0("c_", coarse_cell_id),
+      node_type = "cell",
+      node_id = coarse_cell_id,
+      FlowAreaHa = EligibleAreaHa
+    ),
+  patch_table |>
+    filter(patch_id %in% warm_start_patch_ids) |>
+    transmute(
+      vertex = paste0("p_", patch_id),
+      node_type = "patch",
+      node_id = patch_id,
+      FlowAreaHa = ExistingPatchAreaHa
+    )
+)
+
+warm_start_edges <- bind_rows(
+  candidate_edges |>
+    filter(i %in% warm_start_ids, j %in% warm_start_ids) |>
+    transmute(from = paste0("c_", i), to = paste0("c_", j)),
+  cell_patch_links |>
+    filter(
+      coarse_cell_id %in% warm_start_ids,
+      patch_id %in% warm_start_patch_ids
+    ) |>
+    transmute(
+      from = paste0("c_", coarse_cell_id),
+      to = paste0("p_", patch_id)
+    )
+) |>
+  distinct()
+
+warm_start_graph <- igraph::graph_from_data_frame(
+  warm_start_edges,
+  directed = FALSE,
+  vertices = warm_start_vertices
+)
+warm_membership_raw <- igraph::components(warm_start_graph)$membership
+warm_membership <- tibble(
+  vertex = names(warm_membership_raw),
+  warm_component = as.integer(warm_membership_raw)
+)
+warm_start_vertices <- warm_start_vertices |>
+  left_join(warm_membership, by = "vertex")
+
+warm_component_summary <- warm_start_vertices |>
+  group_by(warm_component) |>
+  summarise(
+    selected_cells = sum(node_type == "cell"),
+    existing_patches = sum(node_type == "patch"),
+    FlowAreaHa = sum(FlowAreaHa),
+    .groups = "drop"
+  )
+
+warm_cell_membership <- warm_start_vertices |>
+  filter(node_type == "cell") |>
+  transmute(
+    coarse_cell_id = node_id,
+    warm_component
+  )
+warm_patch_membership <- warm_start_vertices |>
+  filter(node_type == "patch") |>
+  transmute(patch_id = node_id, warm_component)
+
+warm_component_network_area <- bind_rows(
+  network_cell_area |>
+    filter(coarse_cell_id %in% warm_start_ids) |>
+    left_join(warm_cell_membership, by = "coarse_cell_id") |>
+    transmute(
+      network_name,
+      warm_component,
+      CertificateAreaHa = NetworkCellAreaHa
+    ),
+  network_patch_area |>
+    filter(patch_id %in% warm_start_patch_ids) |>
+    left_join(warm_patch_membership, by = "patch_id") |>
+    transmute(
+      network_name,
+      warm_component,
+      CertificateAreaHa = NetworkPatchAreaHa
+    )
+) |>
+  group_by(network_name, warm_component) |>
+  summarise(
+    CertifiedAreaHa = sum(CertificateAreaHa),
+    .groups = "drop"
+  ) |>
+  left_join(warm_component_summary, by = "warm_component") |>
+  mutate(
+    RequiredAreaHa = unname(network_minimums[network_name]),
+    HasExistingRoot = existing_patches > 0,
+    HasNewRestoration = selected_cells > 0,
+    PassesArea = CertifiedAreaHa >= RequiredAreaHa - 1e-8,
+    FeasibleWarmCertificate =
+      HasExistingRoot & HasNewRestoration & PassesArea
+  )
+
+chosen_certificate_components <- map_dfr(
+  required_networks,
+  function(k) {
+    choices <- warm_component_network_area |>
+      filter(
+        network_name == k,
+        FeasibleWarmCertificate
+      ) |>
+      arrange(desc(CertifiedAreaHa), warm_component)
+
+    if (!nrow(choices)) {
+      stop(
+        "The warm-up result cannot seed required certificate ",
+        k,
+        ". Inspect warm_start_component_network_audit.csv. ",
+        "The hard model itself may still be feasible, but this notebook ",
+        "deliberately stops rather than claiming a feasible warm start.",
+        call. = FALSE
+      )
+    }
+
+    choices |>
+      slice_head(n = 1L)
+  }
+)
+
+readr::write_csv(
+  warm_component_network_area,
+  file.path(problem_dir, "warm_start_component_network_audit.csv")
+)
+readr::write_csv(
+  chosen_certificate_components,
+  file.path(problem_dir, "warm_start_chosen_certificates.csv")
+)
+
+knitr::kable(
+  chosen_certificate_components |>
+    select(
+      network_name,
+      warm_component,
+      RequiredAreaHa,
+      CertifiedAreaHa,
+      selected_cells,
+      existing_patches
+    ),
+  digits = 2
+)
+```
+
+# Construct complete flow starts for all five certificates
+
+Each chosen component is converted to a deterministic spanning tree directed
+toward its largest existing-nature patch. Subtree areas give a complete
+feasible start for the continuous flow variables as well as all binary
+variables.
+
+```{r build-complete-mip-start}
+build_certificate_start <- function(network_name, component_id) {
+  component_nodes <- warm_start_vertices |>
+    filter(warm_component == component_id)
+
+  root_row <- component_nodes |>
+    filter(node_type == "patch") |>
+    arrange(desc(FlowAreaHa), node_id) |>
+    slice_head(n = 1L)
+  if (nrow(root_row) != 1L) {
+    stop("Certificate has no existing-nature root.", call. = FALSE)
+  }
+
+  root_vertex <- root_row$vertex[[1]]
+  component_graph <- igraph::induced_subgraph(
+    warm_start_graph,
+    vids = component_nodes$vertex
+  )
+
+  distances_to_root <- as.numeric(igraph::distances(
+    component_graph,
+    v = root_vertex,
+    to = igraph::V(component_graph),
+    mode = "all"
+  )[1, ])
+  names(distances_to_root) <- igraph::V(component_graph)$name
+  if (any(!is.finite(distances_to_root))) {
+    stop("Internal error: certificate component is disconnected.")
+  }
+
+  all_vertices <- component_nodes$vertex
+  parent <- stats::setNames(
+    rep(NA_character_, length(all_vertices)),
+    all_vertices
+  )
+
+  for (vertex in setdiff(all_vertices, root_vertex)) {
+    neighbors <- igraph::as_ids(igraph::neighbors(
+      component_graph,
+      vertex,
+      mode = "all"
+    ))
+    possible_parents <- neighbors[
+      distances_to_root[neighbors] ==
+        distances_to_root[[vertex]] - 1
+    ]
+    if (!length(possible_parents)) {
+      stop("Could not assign a flow-tree parent to ", vertex)
+    }
+    parent[[vertex]] <- sort(possible_parents)[[1]]
+  }
+
+  subtree_area <- stats::setNames(
+    component_nodes$FlowAreaHa[match(
+      all_vertices,
+      component_nodes$vertex
+    )],
+    all_vertices
+  )
+  flow_records <- list()
+  flow_index <- 0L
+  descending_vertices <- all_vertices[
+    order(distances_to_root[all_vertices], decreasing = TRUE)
+  ]
+
+  for (vertex in descending_vertices) {
+    if (vertex == root_vertex) next
+    parent_vertex <- parent[[vertex]]
+    flow_index <- flow_index + 1L
+    flow_records[[flow_index]] <- tibble(
+      network_name = network_name,
+      child = vertex,
+      parent = parent_vertex,
+      flow_ha = subtree_area[[vertex]]
+    )
+    subtree_area[[parent_vertex]] <-
+      subtree_area[[parent_vertex]] + subtree_area[[vertex]]
+  }
+
+  flow_table <- bind_rows(flow_records) |>
+    mutate(
+      child_type = str_sub(child, 1, 1),
+      parent_type = str_sub(parent, 1, 1),
+      child_id = as.integer(str_remove(child, "^[cp]_")),
+      parent_id = as.integer(str_remove(parent, "^[cp]_"))
+    )
+
+  if (any(
+    flow_table$child_type == "p" &
+      flow_table$parent_type == "p"
+  )) {
+    stop("Unexpected patch-to-patch edge in a flow tree.")
+  }
+
+  list(
+    network_name = network_name,
+    component_id = component_id,
+    cells = component_nodes |>
+      filter(node_type == "cell") |>
+      pull(node_id) |>
+      as.integer() |>
+      sort(),
+    patches = component_nodes |>
+      filter(node_type == "patch") |>
+      pull(node_id) |>
+      as.integer() |>
+      sort(),
+    root_patch = as.integer(root_row$node_id[[1]]),
+    collected_area_ha = subtree_area[[root_vertex]],
+    flows = flow_table
+  )
+}
+
+certificate_starts <- map(
+  seq_len(nrow(chosen_certificate_components)),
+  function(index) {
+    build_certificate_start(
+      chosen_certificate_components$network_name[[index]],
+      chosen_certificate_components$warm_component[[index]]
+    )
+  }
+)
+names(certificate_starts) <- map_chr(
+  certificate_starts,
+  "network_name"
+)
+
+start_certificate_cell_members <- map_dfr(
+  certificate_starts,
+  function(x) tibble(
+    network_name = x$network_name,
+    coarse_cell_id = x$cells
+  )
+)
+start_certificate_patch_members <- map_dfr(
+  certificate_starts,
+  function(x) tibble(
+    network_name = x$network_name,
+    patch_id = x$patches
+  )
+)
+start_certificate_roots <- map_dfr(
+  certificate_starts,
+  function(x) tibble(
+    network_name = x$network_name,
+    patch_id = x$root_patch,
+    collected_area_ha = x$collected_area_ha
+  )
+)
+start_certificate_flows <- map_dfr(certificate_starts, "flows")
+
+start_flow_structure_audit <- map_dfr(
+  certificate_starts,
+  function(x) {
+    expected_collected <-
+      sum(candidate_table$EligibleAreaHa[
+        match(x$cells, candidate_table$coarse_cell_id)
+      ]) +
+      sum(patch_table$ExistingPatchAreaHa[
+        match(x$patches, patch_table$patch_id)
+      ])
+
+    tibble(
+      network_name = x$network_name,
+      member_nodes = length(x$cells) + length(x$patches),
+      spanning_tree_arcs = nrow(x$flows),
+      expected_collected_area_ha = expected_collected,
+      start_collected_area_ha = x$collected_area_ha,
+      tree_has_n_minus_one_arcs =
+        nrow(x$flows) == length(x$cells) + length(x$patches) - 1L,
+      collected_area_reconciles =
+        abs(x$collected_area_ha - expected_collected) <= 1e-6,
+      all_tree_flows_positive = all(x$flows$flow_ha > 0)
+    )
+  }
+)
+
+if (!all(
+  start_flow_structure_audit$tree_has_n_minus_one_arcs &
+    start_flow_structure_audit$collected_area_reconciles &
+    start_flow_structure_audit$all_tree_flows_positive
+)) {
+  stop("Internal error in certificate flow starts.", call. = FALSE)
+}
+
+# Independent membership and area checks before any AMPL files are written.
+start_certificate_area_check <- bind_rows(
+  start_certificate_cell_members |>
+    left_join(
+      network_cell_area,
+      by = c("network_name", "coarse_cell_id")
+    ) |>
+    transmute(
+      network_name,
+      area_ha = coalesce(NetworkCellAreaHa, 0)
+    ),
+  start_certificate_patch_members |>
+    left_join(
+      network_patch_area,
+      by = c("network_name", "patch_id")
+    ) |>
+    transmute(
+      network_name,
+      area_ha = coalesce(NetworkPatchAreaHa, 0)
+    )
+) |>
+  group_by(network_name) |>
+  summarise(CertifiedAreaHa = sum(area_ha), .groups = "drop") |>
+  mutate(
+    RequiredAreaHa = unname(network_minimums[network_name]),
+    Passes = CertifiedAreaHa >= RequiredAreaHa - 1e-6
+  )
+
+if (
+  nrow(start_certificate_area_check) != length(required_networks) ||
+  !all(start_certificate_area_check$Passes)
+) {
+  stop("Internal error in warm-start certificate areas.", call. = FALSE)
+}
+
+if (
+  nrow(start_certificate_roots) != length(required_networks) ||
+  anyDuplicated(start_certificate_roots$network_name)
+) {
+  stop("Each certificate must have exactly one root.", call. = FALSE)
+}
+
+readr::write_csv(
+  start_certificate_area_check,
+  file.path(problem_dir, "warm_start_certificate_area_check.csv")
+)
+readr::write_csv(
+  start_certificate_roots,
+  file.path(problem_dir, "warm_start_certificate_roots.csv")
+)
+readr::write_csv(
+  start_flow_structure_audit,
+  file.path(problem_dir, "warm_start_flow_structure_audit.csv")
+)
+
+print(knitr::kable(start_certificate_area_check, digits = 2))
+knitr::kable(start_flow_structure_audit, digits = 6)
+```
+
+# Export AMPL data, complete MIP start, and run file
+
+```{r export-ampl}
+dat_path <- file.path(problem_dir, paste0(problem_name, ".dat"))
+mip_start_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_mip_start.run")
+)
+run_path <- file.path(problem_dir, paste0(problem_name, ".run"))
+
+solution_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_selected_cells.tsv")
+)
+selected_subarea_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_selected_cell_subareas.tsv")
+)
+subarea_solution_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_subarea_summary.tsv")
+)
+network_cell_solution_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_network_cells.tsv")
+)
+network_patch_solution_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_network_patches.tsv")
+)
+network_root_solution_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_network_roots.tsv")
+)
+network_solution_summary_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_network_summary.tsv")
+)
+summary_path <- file.path(
+  problem_dir,
+  paste0(problem_name, "_solution_summary.tsv")
+)
+
+dat_temporary_path <- paste0(dat_path, ".building")
+writeLines(
+  c(
+    "# Generated by 08_gudenaa_new_area_200m_hard_networks.Rmd",
+    paste("# Polygon area (ha):", ampl_number(sum(polygon_areas_ha))),
+    paste(
+      "# Global network minimum (ha):",
+      ampl_number(global_network_minimum_ha)
+    ),
+    paste(
+      "# Per-subarea network minimum (ha):",
+      ampl_number(subarea_network_minimum_ha)
+    ),
+    "# Carbon, MustIncludeCells, and forest/wet quotas are absent.",
+    ""
+  ),
+  dat_temporary_path
+)
+
+write_ampl_set(dat_temporary_path, "Cells", candidate_cells)
+write_ampl_set(dat_temporary_path, "Landuses", nature_landuses)
+write_ampl_set(dat_temporary_path, "ForestLanduses", forest_landuses)
+write_ampl_set(
+  dat_temporary_path,
+  "Subareas",
+  subarea_budget$subarea_id
+)
+write_ampl_set(
+  dat_temporary_path,
+  "RequiredNetworks",
+  required_networks
+)
+write_ampl_set(dat_temporary_path, "GlobalNetworks", "Global")
+write_ampl_pair_set(
+  dat_temporary_path,
+  "AllowedActions",
+  allowed_actions$landuse,
+  allowed_actions$coarse_cell_id
+)
+write_ampl_pair_set(
+  dat_temporary_path,
+  "E",
+  candidate_edges$i,
+  candidate_edges$j
+)
+write_ampl_triple_set(
+  dat_temporary_path,
+  "SameHabitatEdges",
+  same_habitat_edges$landuse,
+  same_habitat_edges$i,
+  same_habitat_edges$j
+)
+write_ampl_set(
+  dat_temporary_path,
+  "ExistingPatches",
+  existing_patches
+)
+write_ampl_pair_set(
+  dat_temporary_path,
+  "CellPatchEdges",
+  cell_patch_links$coarse_cell_id,
+  cell_patch_links$patch_id
+)
+
+write_ampl_matrix(
+  dat_temporary_path,
+  "BioDiversity",
+  objective_table$landuse,
+  objective_table$coarse_cell_id,
+  objective_table$BioDiversity
+)
+write_ampl_matrix(
+  dat_temporary_path,
+  "ExistingNatureContact",
+  objective_table$landuse,
+  objective_table$coarse_cell_id,
+  objective_table$ExistingNatureContact
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "RestorableAreaHa",
+  candidate_table$coarse_cell_id,
+  candidate_table$EligibleAreaHa
+)
+write_ampl_matrix(
+  dat_temporary_path,
+  "RestorableAreaHaBySubarea",
+  restorable_area_by_subarea_cell$subarea_id,
+  restorable_area_by_subarea_cell$coarse_cell_id,
+  restorable_area_by_subarea_cell$RestorableAreaHaBySubarea
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "SubareaAreaHa",
+  subarea_budget$subarea_id,
+  subarea_budget$PolygonAreaHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "CurrentNatureAreaHa",
+  subarea_budget$subarea_id,
+  subarea_budget$CurrentNatureAreaHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "FinalNatureTargetHa",
+  subarea_budget$subarea_id,
+  subarea_budget$FinalNatureTargetHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "RestorationRequirementHa",
+  subarea_budget$subarea_id,
+  subarea_budget$RestorationRequirementHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "RestorationToleranceHa",
+  subarea_budget$subarea_id,
+  subarea_budget$RestorationToleranceHa
+)
+
+write_ampl_vector(
+  dat_temporary_path,
+  "ExistingPatchAreaHa",
+  patch_table$patch_id,
+  patch_table$ExistingPatchAreaHa
+)
+write_ampl_matrix(
+  dat_temporary_path,
+  "NetworkCellAreaHa",
+  network_cell_area$network_name,
+  network_cell_area$coarse_cell_id,
+  network_cell_area$NetworkCellAreaHa
+)
+write_ampl_matrix(
+  dat_temporary_path,
+  "NetworkPatchAreaHa",
+  network_patch_area$network_name,
+  network_patch_area$patch_id,
+  network_patch_area$NetworkPatchAreaHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "NetworkMinimumHa",
+  names(network_minimums),
+  unname(network_minimums)
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "ComponentMaxAreaCellHa",
+  cell_component_bounds$coarse_cell_id,
+  cell_component_bounds$ComponentMaxAreaHa
+)
+write_ampl_vector(
+  dat_temporary_path,
+  "ComponentMaxAreaPatchHa",
+  patch_component_bounds$patch_id,
+  patch_component_bounds$ComponentMaxAreaHa
+)
+
+production_forest_cells <- candidate_table$coarse_cell_id[
+  candidate_table$IsProductionForestCell == 1L
+]
+write_ampl_vector(
+  dat_temporary_path,
+  "IsProductionForestCell",
+  production_forest_cells,
+  rep(1, length(production_forest_cells))
+)
+
+write_ampl_scalar(
+  dat_temporary_path,
+  "BiodiversityNormalizer",
+  biodiversity_normalizer
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "ContiguityNormalizer",
+  contiguity_normalizer
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "ExistingNatureContactNormalizer",
+  existing_nature_contact_normalizer
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "PatchConnectionNormalizer",
+  patch_connection_normalizer
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "SpatialContiguityBonus",
+  spatial_contiguity_bonus
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "NewToNewAdjacencyWeight",
+  new_to_new_adjacency_weight
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "ExistingToNewAdjacencyWeight",
+  existing_to_new_adjacency_weight
+)
+write_ampl_scalar(
+  dat_temporary_path,
+  "ConnectedExistingPatchBonus",
+  connected_existing_patch_bonus
+)
+
+dat_text <- readLines(dat_temporary_path, warn = FALSE)
+forbidden_tokens <- grepl(
+  "(^|[[:space:]])(NA|NaN|Inf|-Inf)([[:space:];]|$)",
+  dat_text
+)
+stopifnot(!any(forbidden_tokens))
+commit_generated_file(dat_temporary_path, dat_path)
+
+# ---- Complete MIP start --------------------------------------------------
+mip_start_temporary_path <- paste0(mip_start_path, ".building")
+writeLines(
+  c(
+    "# Complete feasible start built from the successful notebook-07 footprint.",
+    "let {c in Cells} Selected[c] := 0;",
+    "let {(l,c) in AllowedActions} LanduseDecision[l,c] := 0;",
+    "let {(l,i,j) in SameHabitatEdges} Contiguity[l,i,j] := 0;",
+    "let {k in RequiredNetworks, c in Cells} NetworkCell[k,c] := 0;",
+    paste0(
+      "let {k in RequiredNetworks, p in ExistingPatches} ",
+      "NetworkPatch[k,p] := 0;"
+    ),
+    paste0(
+      "let {k in RequiredNetworks, p in ExistingPatches} ",
+      "NetworkRoot[k,p] := 0;"
+    ),
+    paste0(
+      "let {k in RequiredNetworks, (i,j) in NetworkArcs} ",
+      "AreaFlowHa[k,i,j] := 0;"
+    ),
+    paste0(
+      "let {k in RequiredNetworks, (c,p) in CellPatchEdges} ",
+      "CellToPatchFlowHa[k,c,p] := 0;"
+    ),
+    paste0(
+      "let {k in RequiredNetworks, (c,p) in CellPatchEdges} ",
+      "PatchToCellFlowHa[k,c,p] := 0;"
+    ),
+    paste0(
+      "let {k in RequiredNetworks, p in ExistingPatches} ",
+      "CollectedAreaHa[k,p] := 0;"
+    )
+  ),
+  mip_start_temporary_path
+)
+
+append_start(
+  mip_start_temporary_path,
+  paste0(
+    "let Selected[",
+    warm_start_assignment$coarse_cell_id,
+    "] := 1;"
+  )
+)
+append_start(
+  mip_start_temporary_path,
+  warm_start_assignment |>
+    transmute(line = paste0(
+      "let LanduseDecision['",
+      landuse,
+      "',",
+      coarse_cell_id,
+      "] := 1;"
+    )) |>
+    pull(line)
+)
+
+start_labels_i <- warm_start_assignment |>
+  transmute(landuse, i = coarse_cell_id)
+start_labels_j <- warm_start_assignment |>
+  transmute(landuse, j = coarse_cell_id)
+start_contiguity <- same_habitat_edges |>
+  semi_join(start_labels_i, by = c("landuse", "i")) |>
+  semi_join(start_labels_j, by = c("landuse", "j"))
+append_start(
+  mip_start_temporary_path,
+  paste0(
+    "let Contiguity['",
+    start_contiguity$landuse,
+    "',",
+    start_contiguity$i,
+    ",",
+    start_contiguity$j,
+    "] := 1;"
+  )
+)
+
+append_start(
+  mip_start_temporary_path,
+  start_certificate_cell_members |>
+    transmute(line = paste0(
+      "let NetworkCell['",
+      network_name,
+      "',",
+      coarse_cell_id,
+      "] := 1;"
+    )) |>
+    pull(line)
+)
+append_start(
+  mip_start_temporary_path,
+  start_certificate_patch_members |>
+    transmute(line = paste0(
+      "let NetworkPatch['",
+      network_name,
+      "',",
+      patch_id,
+      "] := 1;"
+    )) |>
+    pull(line)
+)
+append_start(
+  mip_start_temporary_path,
+  start_certificate_roots |>
+    transmute(line = paste0(
+      "let NetworkRoot['",
+      network_name,
+      "',",
+      patch_id,
+      "] := 1;"
+    )) |>
+    pull(line)
+)
+
+flow_start_lines <- start_certificate_flows |>
+  mutate(line = case_when(
+    child_type == "c" & parent_type == "c" ~ paste0(
+      "let AreaFlowHa['",
+      network_name,
+      "',",
+      child_id,
+      ",",
+      parent_id,
+      "] := ",
+      ampl_number(flow_ha),
+      ";"
+    ),
+    child_type == "c" & parent_type == "p" ~ paste0(
+      "let CellToPatchFlowHa['",
+      network_name,
+      "',",
+      child_id,
+      ",",
+      parent_id,
+      "] := ",
+      ampl_number(flow_ha),
+      ";"
+    ),
+    child_type == "p" & parent_type == "c" ~ paste0(
+      "let PatchToCellFlowHa['",
+      network_name,
+      "',",
+      parent_id,
+      ",",
+      child_id,
+      "] := ",
+      ampl_number(flow_ha),
+      ";"
+    ),
+    TRUE ~ NA_character_
+  ))
+stopifnot(!anyNA(flow_start_lines$line))
+append_start(mip_start_temporary_path, flow_start_lines$line)
+
+append_start(
+  mip_start_temporary_path,
+  start_certificate_roots |>
+    transmute(line = paste0(
+      "let CollectedAreaHa['",
+      network_name,
+      "',",
+      patch_id,
+      "] := ",
+      ampl_number(collected_area_ha),
+      ";"
+    )) |>
+    pull(line)
+)
+commit_generated_file(mip_start_temporary_path, mip_start_path)
+```
+
+```{r export-run-and-audits}
+run_lines <- c(
+  "reset;",
+  "",
+  paste0('model "', ampl_path(model_path), '";'),
+  paste0('data "', ampl_path(dat_path), '";'),
+  paste0('include "', ampl_path(mip_start_path), '";'),
+  "",
+  paste("option solver", solver_name, ";"),
+  if (nzchar(solver_options)) {
+    paste0(
+      "option ", solver_name, "_options '",
+      ampl_path(solver_options), "';"
+    )
+  },
+  "solve;",
+  "display solve_result_num, solve_result;",
+  "",
+  paste0(
+    'printf "coarse_cell_id\\tlanduse\\trestored_ha',
+    '\\tbiodiversity\\texisting_nature_contact_edges\\n" > "',
+    ampl_path(solution_path), '";'
+  ),
+  paste0(
+    'printf {(l,c) in AllowedActions: ',
+    'LanduseDecision[l,c] > 0.5} ',
+    '"%d\\t%s\\t%.8f\\t%.8f\\t%.8f\\n", ',
+    'c, l, RestorableAreaHa[c], BioDiversity[l,c], ',
+    'ExistingNatureContact[l,c] >> "',
+    ampl_path(solution_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "subarea_id\\tcoarse_cell_id\\trestored_ha\\n" > "',
+    ampl_path(selected_subarea_path), '";'
+  ),
+  paste0(
+    'printf {s in Subareas, c in Cells: Selected[c] > 0.5 ',
+    'and RestorableAreaHaBySubarea[s,c] > 0} ',
+    '"%d\\t%d\\t%.8f\\n", s, c, ',
+    'RestorableAreaHaBySubarea[s,c] >> "',
+    ampl_path(selected_subarea_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "subarea_id\\tpolygon_ha\\ttarget_ha\\tcurrent_ha',
+    '\\trequired_restoration_ha\\trestored_ha\\tfinal_nature_ha',
+    '\\tfinal_nature_percent\\n" > "',
+    ampl_path(subarea_solution_path), '";'
+  ),
+  paste0(
+    'printf {s in Subareas} ',
+    '"%d\\t%.8f\\t%.8f\\t%.8f\\t%.8f\\t%.8f\\t%.8f',
+    '\\t%.8f\\n", ',
+    's, SubareaAreaHa[s], FinalNatureTargetHa[s], ',
+    'CurrentNatureAreaHa[s], RestorationRequirementHa[s], ',
+    'sum {c in Cells} RestorableAreaHaBySubarea[s,c] * Selected[c], ',
+    'CurrentNatureAreaHa[s] + sum {c in Cells} ',
+    'RestorableAreaHaBySubarea[s,c] * Selected[c], ',
+    '100 * (CurrentNatureAreaHa[s] + sum {c in Cells} ',
+    'RestorableAreaHaBySubarea[s,c] * Selected[c]) / ',
+    'SubareaAreaHa[s] >> "', ampl_path(subarea_solution_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "network_name\\tcoarse_cell_id\\tcounted_area_ha',
+    '\\ttotal_restorable_ha\\n" > "',
+    ampl_path(network_cell_solution_path), '";'
+  ),
+  paste0(
+    'printf {k in RequiredNetworks, c in Cells: ',
+    'NetworkCell[k,c] > 0.5} ',
+    '"%s\\t%d\\t%.8f\\t%.8f\\n", ',
+    'k, c, NetworkCellAreaHa[k,c], RestorableAreaHa[c] >> "',
+    ampl_path(network_cell_solution_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "network_name\\tpatch_id\\tcounted_area_ha',
+    '\\ttotal_patch_ha\\n" > "',
+    ampl_path(network_patch_solution_path), '";'
+  ),
+  paste0(
+    'printf {k in RequiredNetworks, p in ExistingPatches: ',
+    'NetworkPatch[k,p] > 0.5} ',
+    '"%s\\t%d\\t%.8f\\t%.8f\\n", ',
+    'k, p, NetworkPatchAreaHa[k,p], ExistingPatchAreaHa[p] >> "',
+    ampl_path(network_patch_solution_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "network_name\\tpatch_id\\tcollected_area_ha\\n" > "',
+    ampl_path(network_root_solution_path), '";'
+  ),
+  paste0(
+    'printf {k in RequiredNetworks, p in ExistingPatches: ',
+    'NetworkRoot[k,p] > 0.5} ',
+    '"%s\\t%d\\t%.8f\\n", k, p, CollectedAreaHa[k,p] >> "',
+    ampl_path(network_root_solution_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "network_name\\tminimum_ha\\tcertified_area_ha',
+    '\\tmember_cells\\tmember_patches\\troot_count',
+    '\\tcollected_total_area_ha\\n" > "',
+    ampl_path(network_solution_summary_path), '";'
+  ),
+  paste0(
+    'printf {k in RequiredNetworks} ',
+    '"%s\\t%.8f\\t%.8f\\t%d\\t%d\\t%d\\t%.8f\\n", ',
+    'k, NetworkMinimumHa[k], ',
+    'sum {c in Cells} NetworkCellAreaHa[k,c] * NetworkCell[k,c] + ',
+    'sum {p in ExistingPatches} NetworkPatchAreaHa[k,p] * ',
+    'NetworkPatch[k,p], ',
+    'sum {c in Cells} NetworkCell[k,c], ',
+    'sum {p in ExistingPatches} NetworkPatch[k,p], ',
+    'sum {p in ExistingPatches} NetworkRoot[k,p], ',
+    'sum {p in ExistingPatches} CollectedAreaHa[k,p] >> "',
+    ampl_path(network_solution_summary_path), '";'
+  ),
+  "",
+  paste0(
+    'printf "item\\tvalue\\n" > "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "solve_result\\t%s\\n", solve_result >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "solve_result_num\\t%d\\n", solve_result_num >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "objective\\t%.10f\\n", ConservationIndex >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "normalized_biodiversity\\t%.10f\\n", ',
+    '(sum {(l,c) in AllowedActions} BioDiversity[l,c] * ',
+    'LanduseDecision[l,c]) / BiodiversityNormalizer >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "normalized_new_to_new_adjacency\\t%.10f\\n", ',
+    '(sum {(l,i,j) in SameHabitatEdges} Contiguity[l,i,j]) / ',
+    'ContiguityNormalizer >> "', ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "normalized_existing_to_new_adjacency\\t%.10f\\n", ',
+    '(sum {(l,c) in AllowedActions} ExistingNatureContact[l,c] * ',
+    'LanduseDecision[l,c]) / ExistingNatureContactNormalizer >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "global_existing_patches_joined_beyond_root\\t%.0f\\n", ',
+    'sum {k in GlobalNetworks, p in ExistingPatches} ',
+    'NetworkPatch[k,p] - 1 >> "', ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "normalized_existing_patch_connection\\t%.10f\\n", ',
+    '(sum {k in GlobalNetworks, p in ExistingPatches} ',
+    'NetworkPatch[k,p] - 1) / PatchConnectionNormalizer >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "selected_cells\\t%.0f\\n", ',
+    'sum {c in Cells} Selected[c] >> "',
+    ampl_path(summary_path), '";'
+  ),
+  paste0(
+    'printf "restored_ha\\t%.8f\\n", ',
+    'sum {c in Cells} RestorableAreaHa[c] * Selected[c] >> "',
+    ampl_path(summary_path), '";'
+  )
+)
+write_lines_if_changed(run_lines, run_path)
+
+problem_audit <- tibble(
+  polygon_area_ha = sum(subarea_budget$PolygonAreaHa),
+  thirty_percent_target_ha =
+    sum(subarea_budget$FinalNatureTargetHa),
+  current_nature_ha = sum(subarea_budget$CurrentNatureAreaHa),
+  required_new_restoration_ha =
+    sum(subarea_budget$RestorationRequirementHa),
+  candidate_cells = length(candidate_cells),
+  allowed_action_binaries = nrow(allowed_actions),
+  same_habitat_binaries = nrow(same_habitat_edges),
+  candidate_rook_edges = nrow(candidate_edges),
+  retained_existing_patches = length(existing_patches),
+  candidate_patch_links = nrow(cell_patch_links),
+  required_network_certificates = length(required_networks),
+  certificate_membership_binaries =
+    length(required_networks) *
+      (length(candidate_cells) + 2 * length(existing_patches)),
+  certificate_flow_variables =
+    length(required_networks) *
+      (2 * nrow(candidate_edges) +
+         2 * nrow(cell_patch_links) +
+         length(existing_patches)),
+  warm_start_selected_cells = nrow(warm_start_assignment),
+  warm_start_label_repairs =
+    sum(warm_start_assignment$forest_rule_repair),
+  spatial_contiguity_bonus = spatial_contiguity_bonus,
+  connected_existing_patch_bonus = connected_existing_patch_bonus,
+  patch_connection_normalizer = patch_connection_normalizer
+)
+
+readr::write_csv(
+  problem_audit,
+  file.path(problem_dir, "problem_size_and_policy_audit.csv")
+)
+
+export_audit <- tibble(
+  file = c("model", "data", "MIP start", "run"),
+  path = c(model_path, dat_path, mip_start_path, run_path),
+  exists = file.exists(c(model_path, dat_path, mip_start_path, run_path)),
+  size_mib = file.info(
+    c(model_path, dat_path, mip_start_path, run_path)
+  )$size / 1024^2
+)
+
+print(knitr::kable(t(problem_audit), digits = 3))
+knitr::kable(export_audit, digits = 3)
+```
+
+# Run AMPL
+
+From PowerShell or Command Prompt at the `BiodiversitySignatureProjects`
+project root:
+
+```{powershell, eval=FALSE}
+ampl Optimization/gudenaa_new_area_200m_30pct_hard_networks/gudenaa_new_area_200m_30pct_hard_networks.run
+```
+
+Or from an open AMPL session at the project root:
+
+```{ampl, eval=FALSE}
+include "Optimization/gudenaa_new_area_200m_30pct_hard_networks/gudenaa_new_area_200m_30pct_hard_networks.run";
+```
+
+In the Gurobi log, look for a line stating that a user MIP start produced or
+loaded a solution. A warm start supplies an incumbent; it does not alter the
+hard constraints or guarantee a faster proof of optimality.
+
+# Post-solve independent audit and maps
+
+Re-knit this notebook after AMPL finishes. Matching patch checkpoints are
+reused. Post-processing runs only when all required solution tables are newer
+than the generated model inputs.
+
+```{r post-solve}
+required_solution_paths <- c(
+  solution_path,
+  subarea_solution_path,
+  network_cell_solution_path,
+  network_patch_solution_path,
+  network_root_solution_path,
+  network_solution_summary_path,
+  summary_path
+)
+
+solution_is_current <- all(file.exists(required_solution_paths))
+if (solution_is_current) {
+  solution_time <- min(file.info(required_solution_paths)$mtime)
+  input_time <- max(file.info(c(
+    model_path,
+    dat_path,
+    mip_start_path,
+    run_path
+  ))$mtime)
+  solution_is_current <- isTRUE(solution_time >= input_time)
+}
+
+if (!solution_is_current) {
+  message(
+    "No current hard-network solution found. Run the generated .run file, ",
+    "then re-knit this notebook."
+  )
+} else {
+  selected_solution <- readr::read_tsv(
+    solution_path,
+    show_col_types = FALSE
+  ) |>
+    mutate(coarse_cell_id = as.integer(coarse_cell_id))
+  ampl_subarea_solution <- readr::read_tsv(
+    subarea_solution_path,
+    show_col_types = FALSE
+  ) |>
+    mutate(subarea_id = as.integer(subarea_id))
+  network_cell_solution <- readr::read_tsv(
+    network_cell_solution_path,
+    show_col_types = FALSE
+  ) |>
+    mutate(coarse_cell_id = as.integer(coarse_cell_id))
+  network_patch_solution <- readr::read_tsv(
+    network_patch_solution_path,
+    show_col_types = FALSE
+  ) |>
+    mutate(patch_id = as.integer(patch_id))
+  network_root_solution <- readr::read_tsv(
+    network_root_solution_path,
+    show_col_types = FALSE
+  ) |>
+    mutate(patch_id = as.integer(patch_id))
+  ampl_network_summary <- readr::read_tsv(
+    network_solution_summary_path,
+    show_col_types = FALSE
+  )
+
+  selected_ids <- selected_solution$coarse_cell_id
+  stopifnot(
+    nrow(selected_solution) > 0L,
+    !anyDuplicated(selected_ids),
+    all(selected_ids %in% candidate_cells),
+    all(selected_solution$landuse %in% nature_landuses),
+    setequal(ampl_network_summary$network_name, required_networks),
+    setequal(network_root_solution$network_name, required_networks)
+  )
+
+  # ---- Four 30% constraints ---------------------------------------------
+  independent_subarea_solution <-
+    restorable_area_by_subarea_cell |>
+    filter(coarse_cell_id %in% selected_ids) |>
+    group_by(subarea_id) |>
+    summarise(
+      IndependentlyRestoredHa = sum(RestorableAreaHaBySubarea),
+      .groups = "drop"
+    ) |>
+    right_join(subarea_budget, by = "subarea_id") |>
+    mutate(
+      IndependentlyRestoredHa = coalesce(IndependentlyRestoredHa, 0),
+      FinalNatureAreaHa =
+        CurrentNatureAreaHa + IndependentlyRestoredHa,
+      FinalNaturePercent =
+        100 * FinalNatureAreaHa / PolygonAreaHa,
+      PassesLower =
+        IndependentlyRestoredHa >=
+          RestorationRequirementHa - 1e-6,
+      PassesUpper =
+        IndependentlyRestoredHa <=
+          RestorationRequirementHa +
+            RestorationToleranceHa + 1e-6
+    ) |>
+    arrange(subarea_id)
+
+  if (!all(
+    independent_subarea_solution$PassesLower &
+      independent_subarea_solution$PassesUpper
+  )) {
+    stop("Independent 30% audit failed.", call. = FALSE)
+  }
+  if (max(abs(
+    ampl_subarea_solution$restored_ha -
+      independent_subarea_solution$IndependentlyRestoredHa
+  )) > 1e-5) {
+    stop("AMPL and R subarea totals disagree.", call. = FALSE)
+  }
+
+  # ---- Production-forest destination rule -------------------------------
+  forest_rule_audit <- selected_solution |>
+    select(coarse_cell_id, landuse) |>
+    left_join(
+      candidate_table |>
+        select(
+          coarse_cell_id,
+          ProductionForestHa,
+          AgricultureHa,
+          ProductionForestShare,
+          IsProductionForestCell
+        ),
+      by = "coarse_cell_id"
+    ) |>
+    mutate(
+      PassesForestRule =
+        IsProductionForestCell == 0L |
+        landuse %in% forest_landuses
+    )
+  if (!all(forest_rule_audit$PassesForestRule)) {
+    stop("Production-forest destination audit failed.", call. = FALSE)
+  }
+
+  # ---- Recalculate the five AMPL certificates ---------------------------
+  independent_certificate_summary <- tibble(
+    network_name = required_networks,
+    RequiredAreaHa = unname(network_minimums[required_networks])
+  ) |>
+    left_join(
+      bind_rows(
+        network_cell_solution |>
+          left_join(
+            network_cell_area,
+            by = c("network_name", "coarse_cell_id")
+          ) |>
+          transmute(
+            network_name,
+            area_ha = coalesce(NetworkCellAreaHa, 0),
+            member_cells = 1L,
+            member_patches = 0L
+          ),
+        network_patch_solution |>
+          left_join(
+            network_patch_area,
+            by = c("network_name", "patch_id")
+          ) |>
+          transmute(
+            network_name,
+            area_ha = coalesce(NetworkPatchAreaHa, 0),
+            member_cells = 0L,
+            member_patches = 1L
+          )
+      ) |>
+        group_by(network_name) |>
+        summarise(
+          IndependentlyCertifiedAreaHa = sum(area_ha),
+          member_cells = sum(member_cells),
+          member_patches = sum(member_patches),
+          .groups = "drop"
+        ),
+      by = "network_name"
+    ) |>
+    left_join(
+      network_root_solution |>
+        count(network_name, name = "root_count"),
+      by = "network_name"
+    ) |>
+    mutate(
+      PassesArea =
+        IndependentlyCertifiedAreaHa >= RequiredAreaHa - 1e-6,
+      PassesOneRoot = root_count == 1L,
+      PassesNewRestoration = member_cells >= 1L,
+      PassesCoarseCertificate =
+        PassesArea & PassesOneRoot & PassesNewRestoration
+    )
+
+  if (
+    anyNA(independent_certificate_summary) ||
+    !all(independent_certificate_summary$PassesCoarseCertificate)
+  ) {
+    stop("Independent AMPL certificate audit failed.", call. = FALSE)
+  }
+  if (any(!network_cell_solution$coarse_cell_id %in% selected_ids)) {
+    stop("A certificate contains an unselected cell.", call. = FALSE)
+  }
+  if (max(abs(
+    ampl_network_summary$certified_area_ha[
+      match(
+        independent_certificate_summary$network_name,
+        ampl_network_summary$network_name
+      )
+    ] - independent_certificate_summary$IndependentlyCertifiedAreaHa
+  )) > 1e-5) {
+    stop("AMPL and R certificate totals disagree.", call. = FALSE)
+  }
+
+  readr::write_csv(
+    independent_subarea_solution,
+    file.path(problem_dir, "independent_subarea_solution_audit.csv")
+  )
+  readr::write_csv(
+    forest_rule_audit,
+    file.path(problem_dir, "production_forest_solution_audit.csv")
+  )
+  readr::write_csv(
+    independent_certificate_summary,
+    file.path(problem_dir, "independent_coarse_certificate_audit.csv")
+  )
+
+  # ---- Exact 10 m final-nature components -------------------------------
+  fine_restoration <- terra::ifel(
+    fine_eligible == 1 & coarse_id_on_fine %in% selected_ids,
+    1,
+    0
+  )
+  fine_restoration <- terra::mask(fine_restoration, fine_landuse)
+  names(fine_restoration) <- "RestorationCells"
+
+  final_nature <- terra::ifel(
+    fine_nature == 1 | fine_restoration == 1,
+    1,
+    0
+  )
+  final_nature <- terra::mask(final_nature, fine_landuse)
+  names(final_nature) <- "FinalNatureCells"
+
+  exact_component_raster <- terra::patches(
+    final_nature,
+    directions = 4,
+    zeroAsNA = TRUE
+  )
+  names(exact_component_raster) <- "component_id"
+
+  exact_component_summary <- zonal_sum_table(
+    c(fine_nature, fine_restoration, final_nature),
+    exact_component_raster,
+    "component_id"
+  ) |>
+    transmute(
+      component_id = as.integer(round(component_id)),
+      CurrentNatureAreaHa =
+        CurrentNatureCells * fine_cell_area_ha,
+      RestorationAreaHa =
+        RestorationCells * fine_cell_area_ha,
+      FinalNatureAreaHa =
+        FinalNatureCells * fine_cell_area_ha,
+      HasExistingNature = CurrentNatureAreaHa > 0,
+      HasNewRestoration = RestorationAreaHa > 0,
+      IsAnchoredRestorationComponent =
+        HasExistingNature & HasNewRestoration
+    ) |>
+    arrange(desc(FinalNatureAreaHa))
+
+  exact_pair_multiplier <- expected_number_of_subareas + 1L
+  exact_component_subarea_zone <- terra::ifel(
+    is.na(exact_component_raster) | is.na(subarea_id_on_fine),
+    NA,
+    exact_component_raster * exact_pair_multiplier +
+      subarea_id_on_fine
+  )
+
+  exact_component_by_subarea <- zonal_sum_table(
+    c(fine_nature, fine_restoration, final_nature),
+    exact_component_subarea_zone,
+    "pair_id"
+  ) |>
+    mutate(
+      component_id = as.integer(floor(
+        pair_id / exact_pair_multiplier
+      )),
+      subarea_id = as.integer(round(
+        pair_id - component_id * exact_pair_multiplier
+      )),
+      CurrentNatureAreaHa =
+        CurrentNatureCells * fine_cell_area_ha,
+      RestorationAreaHa =
+        RestorationCells * fine_cell_area_ha,
+      FinalNatureAreaHa =
+        FinalNatureCells * fine_cell_area_ha
+    ) |>
+    filter(
+      subarea_id %in% seq_len(expected_number_of_subareas)
+    ) |>
+    select(
+      component_id,
+      subarea_id,
+      CurrentNatureAreaHa,
+      RestorationAreaHa,
+      FinalNatureAreaHa
+    ) |>
+    left_join(
+      exact_component_summary |>
+        select(
+          component_id,
+          HasExistingNature,
+          HasNewRestoration,
+          IsAnchoredRestorationComponent
+        ),
+      by = "component_id"
+    ) |>
+    arrange(subarea_id, desc(FinalNatureAreaHa))
+
+  exact_anchored_components <- exact_component_summary |>
+    filter(IsAnchoredRestorationComponent)
+
+  if (nrow(exact_anchored_components)) {
+    exact_global_row <- exact_anchored_components |>
+      slice_max(FinalNatureAreaHa, n = 1, with_ties = FALSE) |>
+      transmute(
+        scope = "whole_polygon",
+        subarea_id = NA_integer_,
+        component_id,
+        RequiredAreaHa = global_network_minimum_ha,
+        ExactFinalNatureAreaHa = FinalNatureAreaHa,
+        ExactCurrentNatureAreaHa = CurrentNatureAreaHa,
+        ExactRestorationAreaHa = RestorationAreaHa,
+        PassesExact10m =
+          ExactFinalNatureAreaHa >= RequiredAreaHa - 1e-6
+      )
+  } else {
+    exact_global_row <- tibble(
+      scope = "whole_polygon",
+      subarea_id = NA_integer_,
+      component_id = NA_integer_,
+      RequiredAreaHa = global_network_minimum_ha,
+      ExactFinalNatureAreaHa = 0,
+      ExactCurrentNatureAreaHa = 0,
+      ExactRestorationAreaHa = 0,
+      PassesExact10m = FALSE
+    )
+  }
+
+  exact_largest_by_subarea <- exact_component_by_subarea |>
+    filter(IsAnchoredRestorationComponent) |>
+    group_by(subarea_id) |>
+    slice_max(FinalNatureAreaHa, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    transmute(
+      subarea_id,
+      component_id,
+      ExactFinalNatureAreaHa = FinalNatureAreaHa,
+      ExactCurrentNatureAreaHa = CurrentNatureAreaHa,
+      ExactRestorationAreaHa = RestorationAreaHa
+    )
+
+  exact_network_goal_audit <- bind_rows(
+    exact_global_row,
+    tibble(
+      subarea_id = seq_len(expected_number_of_subareas),
+      scope = subarea_labels,
+      RequiredAreaHa = subarea_network_minimum_ha
+    ) |>
+      left_join(exact_largest_by_subarea, by = "subarea_id") |>
+      mutate(
+        ExactFinalNatureAreaHa = coalesce(
+          ExactFinalNatureAreaHa,
+          0
+        ),
+        ExactCurrentNatureAreaHa = coalesce(
+          ExactCurrentNatureAreaHa,
+          0
+        ),
+        ExactRestorationAreaHa = coalesce(
+          ExactRestorationAreaHa,
+          0
+        ),
+        PassesExact10m =
+          ExactFinalNatureAreaHa >= RequiredAreaHa - 1e-6
+      ) |>
+      select(
+        scope,
+        subarea_id,
+        component_id,
+        RequiredAreaHa,
+        ExactFinalNatureAreaHa,
+        ExactCurrentNatureAreaHa,
+        ExactRestorationAreaHa,
+        PassesExact10m
+      )
+  )
+
+  readr::write_csv(
+    exact_component_summary,
+    file.path(problem_dir, "exact_10m_final_nature_components.csv")
+  )
+  readr::write_csv(
+    exact_component_by_subarea,
+    file.path(problem_dir, "exact_10m_component_by_subarea.csv")
+  )
+  readr::write_csv(
+    exact_network_goal_audit,
+    file.path(problem_dir, "exact_10m_network_goal_audit.csv")
+  )
+
+  # ---- Rasters for inspection and the next refinement -------------------
+  selected_coarse <- coarse_cell_id
+  selected_values <- rep(NA_integer_, terra::ncell(selected_coarse))
+  selected_values[candidate_cells] <- 0L
+  selected_values[selected_ids] <- 1L
+  terra::values(selected_coarse) <- selected_values
+  names(selected_coarse) <- "selected_200m"
+
+  landuse_lookup <- tibble(
+    warm_start_code = seq_along(nature_landuses),
+    landuse = nature_landuses
+  )
+  destination_coarse <- coarse_cell_id
+  destination_values <- rep(
+    NA_integer_,
+    terra::ncell(destination_coarse)
+  )
+  destination_values[selected_ids] <- landuse_lookup$warm_start_code[
+    match(selected_solution$landuse, landuse_lookup$landuse)
+  ]
+  terra::values(destination_coarse) <- destination_values
+  names(destination_coarse) <- "warm_start_landuse"
+
+  destination_fine <- align_to_template(
+    destination_coarse,
+    fine_landuse,
+    method = "near"
+  )
+  destination_fine <- terra::mask(
+    destination_fine,
+    fine_eligible_mask
+  )
+
+  terra::writeRaster(
+    selected_coarse,
+    file.path(problem_dir, "selected_coarse_cells_200m.tif"),
+    overwrite = TRUE,
+    datatype = "INT1U",
+    gdal = c("COMPRESS=DEFLATE", "TILED=YES")
+  )
+  terra::writeRaster(
+    fine_restoration,
+    file.path(problem_dir, "hard_solution_restoration_10m.tif"),
+    overwrite = TRUE,
+    datatype = "INT1U",
+    gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=YES")
+  )
+  terra::writeRaster(
+    final_nature,
+    file.path(problem_dir, "hard_solution_final_nature_10m.tif"),
+    overwrite = TRUE,
+    datatype = "INT1U",
+    gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=YES")
+  )
+  terra::writeRaster(
+    exact_component_raster,
+    file.path(
+      problem_dir,
+      "hard_solution_final_nature_components_10m.tif"
+    ),
+    overwrite = TRUE,
+    datatype = "INT4U",
+    gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=YES")
+  )
+  terra::writeRaster(
+    destination_fine,
+    file.path(
+      problem_dir,
+      "hard_solution_landuse_warm_start_10m.tif"
+    ),
+    overwrite = TRUE,
+    datatype = "INT1U",
+    gdal = c("COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=YES")
+  )
+  readr::write_csv(
+    landuse_lookup,
+    file.path(problem_dir, "warm_start_landuse_lookup.csv")
+  )
+
+  print(independent_subarea_solution)
+  print(independent_certificate_summary)
+  print(exact_network_goal_audit)
+
+  if (!all(exact_network_goal_audit$PassesExact10m)) {
+    warning(
+      "The AMPL 200 m certificates pass, but one or more exact 10 m ",
+      "network goals fail. Use this result as the targeted input to a ",
+      "10 m refinement; do not report the failed goal as achieved."
+    )
+  }
+}
+```
+
+# Quick plots
+
+```{r quick-plots, eval=FALSE}
+result_dir <- file.path(
+  "Optimization",
+  "gudenaa_new_area_200m_30pct_hard_networks"
+)
+
+plot(terra::rast(file.path(
+  result_dir,
+  "hard_solution_landuse_warm_start_10m.tif"
+)))
+
+plot(terra::rast(file.path(
+  result_dir,
+  "hard_solution_final_nature_components_10m.tif"
+)))
+```
+
+# Interpretation safeguards
+
+1. The hard model certifies connectivity on the 200 m graph. The independent
+   `exact_10m_network_goal_audit.csv` is the authority for fine-resolution
+   reporting.
+2. Existing and newly restored nature both count toward 5,000/1,000 ha.
+   Every certificate contains at least one selected restoration cell and is
+   rooted at one existing-nature patch.
+3. A component may satisfy several subarea certificates. Its area counted for
+   `Subarea3`, for example, is only the part physically inside subarea 3, even
+   if the connecting route crosses another subarea.
+4. The patch-connection term is a preference. The model must connect at least
+   one existing patch because of anchoring, but it is not forced to connect two
+   or more if that would make the other objectives worse.
+5. The production-forest rule is a 200 m approximation: a unit is classified
+   as production forest when at least 50% of its eligible area is that source
+   class. A later 10 m model can enforce source-specific transitions exactly.
+6. The previous warm-up folder is read-only. This stage writes only to
+   `Optimization/gudenaa_new_area_200m_30pct_hard_networks/`; no old `.dat`
+   file or output folder should be deleted.
