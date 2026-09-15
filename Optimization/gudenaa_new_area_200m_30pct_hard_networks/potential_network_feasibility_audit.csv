@@ -1,0 +1,6 @@
+network_name,RequiredAreaHa,anchored_potential_components,feasible_potential_components,largest_potential_certificate_ha,PassesPotentialGraph
+Global,5000,102,0,2912.0700000000024,FALSE
+Subarea1,1000,16,3,1520.4171986816418,TRUE
+Subarea2,1000,40,0,571.3800052734379,FALSE
+Subarea3,1000,38,3,2300.448011083986,TRUE
+Subarea4,1000,12,3,2909.425804589846,TRUE
