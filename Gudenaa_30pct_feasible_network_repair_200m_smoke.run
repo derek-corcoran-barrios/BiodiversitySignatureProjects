@@ -37,8 +37,8 @@ if sum {k in RequiredNetworks} NetworkShortfallHa[k] <= 0.000001 then {
   restore RepairQuality;
   solve;
   display solve_result, RepairQuality;
-  display {k in RequiredNetworks}
-    NetworkShortfallHa[k], CertificateBuilt[k];
+  display {k in RequiredNetworks} NetworkShortfallHa[k];
+  display {k in RequiredNetworks} CertificateBuilt[k];
 } else {
   display {k in RequiredNetworks} NetworkShortfallHa[k];
 }
