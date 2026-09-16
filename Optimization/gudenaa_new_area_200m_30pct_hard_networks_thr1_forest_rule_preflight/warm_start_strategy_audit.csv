@@ -1,0 +1,6 @@
+network_name,feasible_warm_components,largest_anchored_warm_certificate_ha,can_seed_complete_start,RequiredAreaHa,shortfall_ha,configured_mode,effective_strategy,potential_graph_passed
+Global,0,934.7400000000004,FALSE,5000,4065.2599999999998,complete_only,gurobi_variable_hints,TRUE
+Subarea1,0,568.6149997558595,FALSE,1000,431.38500024414054,complete_only,gurobi_variable_hints,TRUE
+Subarea2,0,797.1585416503909,FALSE,1000,202.84145834960907,complete_only,gurobi_variable_hints,TRUE
+Subarea3,0,450.21467309570335,FALSE,1000,549.7853269042967,complete_only,gurobi_variable_hints,TRUE
+Subarea4,0,602.7143958251957,FALSE,1000,397.28560417480435,complete_only,gurobi_variable_hints,TRUE
