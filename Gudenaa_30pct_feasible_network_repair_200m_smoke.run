@@ -1,0 +1,44 @@
+reset;
+model "Gudenaa_30pct_feasible_network_repair_200m.mod";
+data "Gudenaa_30pct_feasible_network_repair_200m_smoke.dat";
+
+let {c in Cells} Selected[c] := 1;
+let {(l,c) in AllowedActions} LanduseDecision[l,c] := 0;
+let {c in Cells} LanduseDecision['ForestDryPoor',c] := 1;
+let {(l,i,j) in SameHabitatEdges} Contiguity[l,i,j] := 1;
+let {k in RequiredNetworks} CertificateBuilt[k] := 0;
+let {k in RequiredNetworks} NetworkShortfallHa[k] := NetworkMinimumHa[k];
+let {(k,c) in EligibleNetworkCells} NetworkCell[k,c] := 0;
+let {(k,p) in EligibleNetworkPatches} NetworkPatch[k,p] := 0;
+let {(k,p) in EligibleNetworkPatches} NetworkRoot[k,p] := 0;
+let {(k,i,j) in NetworkCellArcs} AreaFlowHa[k,i,j] := 0;
+let {(k,c,p) in NetworkCellPatchEdges} CellToPatchFlowHa[k,c,p] := 0;
+let {(k,c,p) in NetworkCellPatchEdges} PatchToCellFlowHa[k,c,p] := 0;
+let {(k,p) in EligibleNetworkPatches} CollectedAreaHa[k,p] := 0;
+
+option solver gurobi;
+option gurobi_options 'lim:time=60 mip:gap=0 mip:start=1 tech:outlev=1';
+
+drop WarmFootprintChange;
+drop RepairQuality;
+solve;
+display solve_result, RelativeNetworkShortfall;
+
+if sum {k in RequiredNetworks} NetworkShortfallHa[k] <= 0.000001 then {
+  fix {k in RequiredNetworks} NetworkShortfallHa[k] := 0;
+  drop RelativeNetworkShortfall;
+  restore WarmFootprintChange;
+  solve;
+  display solve_result, WarmFootprintChange;
+
+  let FootprintChangeLimitHa :=
+    WarmFootprintChange + RepairChangeToleranceHa;
+  drop WarmFootprintChange;
+  restore RepairQuality;
+  solve;
+  display solve_result, RepairQuality;
+  display {k in RequiredNetworks}
+    NetworkShortfallHa[k], CertificateBuilt[k];
+} else {
+  display {k in RequiredNetworks} NetworkShortfallHa[k];
+}

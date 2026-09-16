@@ -1,0 +1,115 @@
+# Tiny synthetic instance for syntax/workflow checking only.
+
+set Cells := 1 2 3 4;
+set Landuses :=
+  ForestDryPoor ForestDryRich ForestWetPoor ForestWetRich
+  OpenDryPoor OpenDryRich OpenWetPoor OpenWetRich;
+set ForestLanduses :=
+  ForestDryPoor ForestDryRich ForestWetPoor ForestWetRich;
+set Subareas := 1 2 3 4;
+set RequiredNetworks := Global Subarea1 Subarea2 Subarea3 Subarea4;
+set GlobalNetworks := Global;
+
+set AllowedActions :=
+  (ForestDryPoor,1) (ForestDryPoor,2) (ForestDryPoor,3) (ForestDryPoor,4)
+  (ForestDryRich,1) (ForestDryRich,2) (ForestDryRich,3) (ForestDryRich,4)
+  (ForestWetPoor,1) (ForestWetPoor,2) (ForestWetPoor,3) (ForestWetPoor,4)
+  (ForestWetRich,1) (ForestWetRich,2) (ForestWetRich,3) (ForestWetRich,4)
+  (OpenDryPoor,1) (OpenDryPoor,2) (OpenDryPoor,3) (OpenDryPoor,4)
+  (OpenDryRich,1) (OpenDryRich,2) (OpenDryRich,3) (OpenDryRich,4)
+  (OpenWetPoor,1) (OpenWetPoor,2) (OpenWetPoor,3) (OpenWetPoor,4)
+  (OpenWetRich,1) (OpenWetRich,2) (OpenWetRich,3) (OpenWetRich,4);
+
+set E := (1,2) (2,3) (3,4);
+set SameHabitatEdges :=
+  (ForestDryPoor,1,2)
+  (ForestDryPoor,2,3)
+  (ForestDryPoor,3,4);
+
+set ExistingPatches := 100;
+set CellPatchEdges := (1,100) (2,100) (3,100) (4,100);
+
+set EligibleNetworkCells :=
+  (Global,1) (Global,2) (Global,3) (Global,4)
+  (Subarea1,1) (Subarea1,2) (Subarea1,3) (Subarea1,4)
+  (Subarea2,1) (Subarea2,2) (Subarea2,3) (Subarea2,4)
+  (Subarea3,1) (Subarea3,2) (Subarea3,3) (Subarea3,4)
+  (Subarea4,1) (Subarea4,2) (Subarea4,3) (Subarea4,4);
+
+set EligibleNetworkPatches :=
+  (Global,100)
+  (Subarea1,100) (Subarea2,100) (Subarea3,100) (Subarea4,100);
+
+set NetworkCellArcs :=
+  (Global,1,2) (Global,2,1) (Global,2,3) (Global,3,2)
+  (Global,3,4) (Global,4,3)
+  (Subarea1,1,2) (Subarea1,2,1) (Subarea1,2,3) (Subarea1,3,2)
+  (Subarea1,3,4) (Subarea1,4,3)
+  (Subarea2,1,2) (Subarea2,2,1) (Subarea2,2,3) (Subarea2,3,2)
+  (Subarea2,3,4) (Subarea2,4,3)
+  (Subarea3,1,2) (Subarea3,2,1) (Subarea3,2,3) (Subarea3,3,2)
+  (Subarea3,3,4) (Subarea3,4,3)
+  (Subarea4,1,2) (Subarea4,2,1) (Subarea4,2,3) (Subarea4,3,2)
+  (Subarea4,3,4) (Subarea4,4,3);
+
+set NetworkCellPatchEdges :=
+  (Global,1,100) (Global,2,100) (Global,3,100) (Global,4,100)
+  (Subarea1,1,100) (Subarea1,2,100) (Subarea1,3,100) (Subarea1,4,100)
+  (Subarea2,1,100) (Subarea2,2,100) (Subarea2,3,100) (Subarea2,4,100)
+  (Subarea3,1,100) (Subarea3,2,100) (Subarea3,3,100) (Subarea3,4,100)
+  (Subarea4,1,100) (Subarea4,2,100) (Subarea4,3,100) (Subarea4,4,100);
+
+param BioDiversity default 0.1 :=
+  ForestDryPoor 1 1
+  ForestDryPoor 2 1
+  ForestDryPoor 3 1
+  ForestDryPoor 4 1;
+
+param RestorableAreaHa := 1 1 2 1 3 1 4 1;
+param RestorableAreaHaBySubarea default 0 :=
+  1 1 1
+  2 2 1
+  3 3 1
+  4 4 1;
+
+param SubareaAreaHa := 1 10 2 10 3 10 4 10;
+param CurrentNatureAreaHa := 1 2 2 2 3 2 4 2;
+param FinalNatureTargetHa := 1 3 2 3 3 3 4 3;
+param RestorationRequirementHa := 1 1 2 1 3 1 4 1;
+param RestorationToleranceHa := 1 0 2 0 3 0 4 0;
+
+param ExistingPatchAreaHa := 100 10;
+
+param NetworkCellAreaHa default 0 :=
+  Global 1 1 Global 2 1 Global 3 1 Global 4 1
+  Subarea1 1 1
+  Subarea2 2 1
+  Subarea3 3 1
+  Subarea4 4 1;
+
+param NetworkPatchAreaHa default 0 :=
+  Global 100 10
+  Subarea1 100 1
+  Subarea2 100 1
+  Subarea3 100 1
+  Subarea4 100 1;
+
+param NetworkMinimumHa :=
+  Global 5
+  Subarea1 1 Subarea2 1 Subarea3 1 Subarea4 1;
+
+param ComponentMaxAreaCellHa := 1 14 2 14 3 14 4 14;
+param ComponentMaxAreaPatchHa := 100 14;
+
+param WarmSelected := 1 1 2 1 3 1 4 1;
+
+param BiodiversityNormalizer := 4;
+param ContiguityNormalizer := 3;
+param ExistingNatureContactNormalizer := 1;
+param PatchConnectionNormalizer := 1;
+param SpatialContiguityBonus := 1.2;
+param NewToNewAdjacencyWeight := 0.5;
+param ExistingToNewAdjacencyWeight := 0.5;
+param ConnectedExistingPatchBonus := 0.25;
+param FootprintChangeLimitHa := 4;
+param RepairChangeToleranceHa := 0.01;
