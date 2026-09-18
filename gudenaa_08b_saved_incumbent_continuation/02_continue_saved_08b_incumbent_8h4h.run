@@ -1,0 +1,333 @@
+# Reset-safe continuation of the 08b constructive repair.
+#
+# This file DOES NOT depend on a solution remaining in AMPL memory.  It:
+#   1. resets AMPL;
+#   2. reloads the matching model and data;
+#   3. loads the complete incumbent written by
+#      01_save_current_08b_incumbent.run;
+#   4. minimizes change from the notebook-07 footprint for up to 8 hours;
+#   5. holds that best footprint (plus 0.01 ha numerical slack) and maximizes
+#      biodiversity/connectivity quality for up to 4 hours;
+#   6. writes separate continuation logs, audits, solution tables, and a new
+#      complete final checkpoint.
+#
+# Prerequisite:
+#   The saved-incumbent file must exist and end with # CHECKPOINT_COMPLETE.
+#
+# Usage from the project root (in a fresh or current AMPL session):
+#
+#   include "gudenaa_08b_saved_incumbent_continuation/02_continue_saved_08b_incumbent_8h4h.run";
+#
+# Expected confirmation near the beginning of Stage 2:
+#   Loaded user MIP start with objective ...
+# The Stage-2 start objective should equal the saved incumbent's footprint
+# change (approximately the last 08b Stage-2/Stage-3 footprint), not 8772.19.
+
+reset;
+
+model "Gudenaa_global30_constructive_network_repair_200m.mod";
+data "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair.dat";
+include "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_saved_incumbent.run";
+
+option solver gurobi;
+
+printf "INCOMPLETE\n" >
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_completion_status.txt";
+
+# Record the solution exactly as reloaded, before either continuation solve.
+printf "item\tvalue\n" >
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_start_audit.tsv";
+printf "network_shortfall_total_ha\t%.8f\n",
+  sum {k in RequiredNetworks} NetworkShortfallHa[k] >>
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_start_audit.tsv";
+printf "warm_footprint_change_ha\t%.8f\n",
+  sum {c in Cells} RestorableAreaHa[c] *
+    (WarmSelected[c] * (1 - Selected[c]) +
+     (1 - WarmSelected[c]) * Selected[c]) >>
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_start_audit.tsv";
+printf "repair_quality\t%.10f\n", RepairQuality >>
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_start_audit.tsv";
+printf "selected_cells\t%.0f\n", sum {c in Cells} Selected[c] >>
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_start_audit.tsv";
+
+printf "stage\tsolve_result\tsolve_result_num\tobjective_value\ttotal_shortfall_ha\tfootprint_change_ha\tfootprint_limit_ha\ttime_limit_seconds\n" >
+  "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage_summary.tsv";
+
+if sum {k in RequiredNetworks} NetworkShortfallHa[k] <= 0.000001 then {
+
+  # The reloaded incumbent is a complete feasible certificate.  Fix the hard
+  # network requirements at zero shortfall for both continuation stages.
+  fix {k in RequiredNetworks} NetworkShortfallHa[k] := 0;
+
+  # -----------------------------------------------------------------------
+  # Stage 2: lexicographic priority 2 -- minimize footprint change.
+  # The saved 08b incumbent is sent as the MIP start.
+  # -----------------------------------------------------------------------
+  drop RelativeNetworkShortfall;
+  drop RepairQuality;
+
+  option gurobi_options
+    'lim:time=28800 mip:gap=0.005 mip:start=1 tech:outlev=1 alg:infunbdinfo=1 tech:logfile=Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage2_minimum_change_gurobi.log tech:resultfile=Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage2.mst';
+
+  solve;
+  display solve_result_num, solve_result, WarmFootprintChange;
+
+  printf "2_minimum_footprint_change\t%s\t%d\t%.10f\t%.8f\t%.8f\t%.8f\t28800\n",
+    solve_result, solve_result_num, WarmFootprintChange,
+    sum {k in RequiredNetworks} NetworkShortfallHa[k],
+    WarmFootprintChange, FootprintChangeLimitHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage_summary.tsv";
+
+  # Preserve the best Stage-2 footprint.  Stage 3 may worsen it by at most
+  # 0.01 ha, which is numerical slack rather than a substantive trade-off.
+  let FootprintChangeLimitHa := WarmFootprintChange + RepairChangeToleranceHa;
+
+  # -----------------------------------------------------------------------
+  # Stage 3: lexicographic priority 3 -- maximize ecological quality.
+  # It begins from the Stage-2 incumbent held in AMPL memory.
+  # -----------------------------------------------------------------------
+  drop WarmFootprintChange;
+  restore RepairQuality;
+
+  option gurobi_options
+    'lim:time=14400 mip:gap=0.005 mip:start=1 tech:outlev=1 alg:infunbdinfo=1 tech:logfile=Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage3_quality_gurobi.log tech:resultfile=Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage3.mst';
+
+  solve;
+  display solve_result_num, solve_result, RepairQuality;
+
+  printf "3_ecological_contiguity_quality\t%s\t%d\t%.10f\t%.8f\t%.8f\t%.8f\t14400\n",
+    solve_result, solve_result_num, RepairQuality,
+    sum {k in RequiredNetworks} NetworkShortfallHa[k],
+    sum {c in Cells} RestorableAreaHa[c] *
+      (WarmSelected[c] * (1 - Selected[c]) +
+       (1 - WarmSelected[c]) * Selected[c]),
+    FootprintChangeLimitHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_stage_summary.tsv";
+
+  # -----------------------------------------------------------------------
+  # Final continuation solution tables.  These use a distinct filename stem
+  # so the original 08b outputs remain untouched for comparison.
+  # -----------------------------------------------------------------------
+  printf "coarse_cell_id\tlanduse\trestored_ha\tbiodiversity\texisting_nature_contact_edges\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_selected_cells.tsv";
+  printf {(l,c) in AllowedActions: LanduseDecision[l,c] > 0.5}
+    "%d\t%s\t%.8f\t%.8f\t%.8f\n", c, l, RestorableAreaHa[c],
+    BioDiversity[l,c], ExistingNatureContact[l,c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_selected_cells.tsv";
+
+  printf "subarea_id\tcoarse_cell_id\trestored_ha\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_selected_cell_subareas.tsv";
+  printf {s in Subareas, c in Cells: Selected[c] > 0.5 and
+    RestorableAreaHaBySubarea[s,c] > 0}
+    "%d\t%d\t%.8f\n", s, c, RestorableAreaHaBySubarea[s,c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_selected_cell_subareas.tsv";
+
+  printf "subarea_id\tpolygon_ha\treference_30pct_target_ha\tcurrent_ha\treference_30pct_restoration_ha\trestored_ha\tfinal_nature_ha\tfinal_nature_percent\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_subarea_summary.tsv";
+  printf {s in Subareas}
+    "%d\t%.8f\t%.8f\t%.8f\t%.8f\t%.8f\t%.8f\t%.8f\n",
+    s, SubareaAreaHa[s], FinalNatureTargetHa[s], CurrentNatureAreaHa[s],
+    RestorationRequirementHa[s],
+    sum {c in Cells} RestorableAreaHaBySubarea[s,c] * Selected[c],
+    CurrentNatureAreaHa[s] +
+      sum {c in Cells} RestorableAreaHaBySubarea[s,c] * Selected[c],
+    100 * (CurrentNatureAreaHa[s] +
+      sum {c in Cells} RestorableAreaHaBySubarea[s,c] * Selected[c]) /
+      SubareaAreaHa[s] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_subarea_summary.tsv";
+
+  printf "network_name\tcoarse_cell_id\tcounted_area_ha\ttotal_restorable_ha\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_cells.tsv";
+  printf {(k,c) in EligibleNetworkCells: NetworkCell[k,c] > 0.5}
+    "%s\t%d\t%.8f\t%.8f\n", k, c, NetworkCellAreaHa[k,c],
+    RestorableAreaHa[c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_cells.tsv";
+
+  printf "network_name\tpatch_id\tcounted_area_ha\ttotal_patch_ha\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_patches.tsv";
+  printf {(k,p) in EligibleNetworkPatches: NetworkPatch[k,p] > 0.5}
+    "%s\t%d\t%.8f\t%.8f\n", k, p, NetworkPatchAreaHa[k,p],
+    ExistingPatchAreaHa[p] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_patches.tsv";
+
+  printf "network_name\tpatch_id\tcollected_area_ha\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_roots.tsv";
+  printf {(k,p) in EligibleNetworkPatches: NetworkRoot[k,p] > 0.5}
+    "%s\t%d\t%.8f\n", k, p, CollectedAreaHa[k,p] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_roots.tsv";
+
+  printf "network_name\tminimum_ha\tcertified_area_ha\tmember_cells\tmember_patches\troot_count\tcollected_total_area_ha\tshortfall_ha\tcertificate_built\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_summary.tsv";
+  printf {k in RequiredNetworks}
+    "%s\t%.8f\t%.8f\t%d\t%d\t%d\t%.8f\t%.8f\t%d\n",
+    k, NetworkMinimumHa[k],
+    sum {(q,c) in EligibleNetworkCells: q = k}
+      NetworkCellAreaHa[q,c] * NetworkCell[q,c] +
+    sum {(q,p) in EligibleNetworkPatches: q = k}
+      NetworkPatchAreaHa[q,p] * NetworkPatch[q,p],
+    sum {(q,c) in EligibleNetworkCells: q = k} NetworkCell[q,c],
+    sum {(q,p) in EligibleNetworkPatches: q = k} NetworkPatch[q,p],
+    sum {(q,p) in EligibleNetworkPatches: q = k} NetworkRoot[q,p],
+    sum {(q,p) in EligibleNetworkPatches: q = k} CollectedAreaHa[q,p],
+    NetworkShortfallHa[k], CertificateBuilt[k] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_network_summary.tsv";
+
+  printf "item\tvalue\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "solve_result\t%s\n", solve_result >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "solve_result_num\t%d\n", solve_result_num >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "repair_status\tsolved_feasible_network_repair\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "objective\t%.10f\n", RepairQuality >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "warm_footprint_change_ha\t%.8f\n",
+    sum {c in Cells} RestorableAreaHa[c] *
+      (WarmSelected[c] * (1 - Selected[c]) +
+       (1 - WarmSelected[c]) * Selected[c]) >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "network_shortfall_total_ha\t%.8f\n",
+    sum {k in RequiredNetworks} NetworkShortfallHa[k] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "spatial_contiguity_bonus\t%.8f\n", SpatialContiguityBonus >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "normalized_biodiversity\t%.10f\n",
+    (sum {(l,c) in AllowedActions} BioDiversity[l,c] *
+      LanduseDecision[l,c]) / BiodiversityNormalizer >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "normalized_new_to_new_adjacency\t%.10f\n",
+    (sum {(l,i,j) in SameHabitatEdges} Contiguity[l,i,j]) /
+      ContiguityNormalizer >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "normalized_existing_to_new_adjacency\t%.10f\n",
+    (sum {(l,c) in AllowedActions} ExistingNatureContact[l,c] *
+      LanduseDecision[l,c]) / ExistingNatureContactNormalizer >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_existing_patches_joined_beyond_root\t%.0f\n",
+    sum {(k,p) in EligibleNetworkPatches: k in GlobalNetworks}
+      NetworkPatch[k,p] -
+    sum {k in GlobalNetworks} CertificateBuilt[k] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "normalized_existing_patch_connection\t%.10f\n",
+    (sum {(k,p) in EligibleNetworkPatches: k in GlobalNetworks}
+      NetworkPatch[k,p] -
+     sum {k in GlobalNetworks} CertificateBuilt[k]) /
+      PatchConnectionNormalizer >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "selected_cells\t%.0f\n", sum {c in Cells} Selected[c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "restored_ha\t%.8f\n",
+    sum {c in Cells} RestorableAreaHa[c] * Selected[c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_polygon_area_ha\t%.8f\n", GlobalPolygonAreaHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_current_nature_ha\t%.8f\n", GlobalCurrentNatureAreaHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_30pct_target_ha\t%.8f\n", GlobalFinalNatureTargetHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_required_restoration_ha\t%.8f\n",
+    GlobalRestorationRequirementHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_restoration_tolerance_ha\t%.8f\n",
+    GlobalRestorationToleranceHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_final_nature_ha\t%.8f\n",
+    GlobalCurrentNatureAreaHa +
+      sum {c in Cells} RestorableAreaHa[c] * Selected[c] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+  printf "global_final_nature_percent\t%.8f\n",
+    100 * (GlobalCurrentNatureAreaHa +
+      sum {c in Cells} RestorableAreaHa[c] * Selected[c]) /
+      GlobalPolygonAreaHa >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_solution_summary.tsv";
+
+  # Save the final Stage-3 incumbent as another complete reset-safe checkpoint.
+  printf "# Complete final checkpoint generated by the 8h+4h continuation.\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "# Reload only after loading the matching .mod and .dat files.\n\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {c in Cells} Selected[c] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(l,c) in AllowedActions} LanduseDecision[l,c] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(l,i,j) in SameHabitatEdges} Contiguity[l,i,j] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {k in RequiredNetworks} CertificateBuilt[k] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {k in RequiredNetworks} NetworkShortfallHa[k] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,c) in EligibleNetworkCells} NetworkCell[k,c] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,p) in EligibleNetworkPatches} NetworkPatch[k,p] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,p) in EligibleNetworkPatches} NetworkRoot[k,p] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,i,j) in NetworkCellArcs} AreaFlowHa[k,i,j] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,c,p) in NetworkCellPatchEdges} CellToPatchFlowHa[k,c,p] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,c,p) in NetworkCellPatchEdges} PatchToCellFlowHa[k,c,p] := 0;\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "let {(k,p) in EligibleNetworkPatches} CollectedAreaHa[k,p] := 0;\n\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {c in Cells: Selected[c] > 0.5}
+    "let Selected[%d] := 1;\n", c >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(l,c) in AllowedActions: LanduseDecision[l,c] > 0.5}
+    "let LanduseDecision['%s',%d] := 1;\n", l, c >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(l,i,j) in SameHabitatEdges: Contiguity[l,i,j] > 0.5}
+    "let Contiguity['%s',%d,%d] := 1;\n", l, i, j >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {k in RequiredNetworks: CertificateBuilt[k] > 0.5}
+    "let CertificateBuilt['%s'] := 1;\n", k >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {k in RequiredNetworks: NetworkShortfallHa[k] > 0.00000001}
+    "let NetworkShortfallHa['%s'] := %.12f;\n", k,
+    NetworkShortfallHa[k] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,c) in EligibleNetworkCells: NetworkCell[k,c] > 0.5}
+    "let NetworkCell['%s',%d] := 1;\n", k, c >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,p) in EligibleNetworkPatches: NetworkPatch[k,p] > 0.5}
+    "let NetworkPatch['%s',%d] := 1;\n", k, p >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,p) in EligibleNetworkPatches: NetworkRoot[k,p] > 0.5}
+    "let NetworkRoot['%s',%d] := 1;\n", k, p >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,i,j) in NetworkCellArcs: AreaFlowHa[k,i,j] > 0.00000001}
+    "let AreaFlowHa['%s',%d,%d] := %.12f;\n", k, i, j,
+    AreaFlowHa[k,i,j] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,c,p) in NetworkCellPatchEdges:
+    CellToPatchFlowHa[k,c,p] > 0.00000001}
+    "let CellToPatchFlowHa['%s',%d,%d] := %.12f;\n", k, c, p,
+    CellToPatchFlowHa[k,c,p] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,c,p) in NetworkCellPatchEdges:
+    PatchToCellFlowHa[k,c,p] > 0.00000001}
+    "let PatchToCellFlowHa['%s',%d,%d] := %.12f;\n", k, c, p,
+    PatchToCellFlowHa[k,c,p] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf {(k,p) in EligibleNetworkPatches:
+    CollectedAreaHa[k,p] > 0.00000001}
+    "let CollectedAreaHa['%s',%d] := %.12f;\n", k, p,
+    CollectedAreaHa[k,p] >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+  printf "\n# CHECKPOINT_COMPLETE\n" >>
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_final_incumbent.run";
+
+  printf "COMPLETE\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_completion_status.txt";
+
+  printf "Continuation complete: final solution tables and checkpoint written.\n";
+
+} else {
+
+  printf "ERROR: the saved incumbent has positive network shortfall.\n";
+  printf "The 8h+4h continuation was not started.\n";
+  printf "FAILED_POSITIVE_START_SHORTFALL\n" >
+    "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_continued_8h4h_completion_status.txt";
+
+}
