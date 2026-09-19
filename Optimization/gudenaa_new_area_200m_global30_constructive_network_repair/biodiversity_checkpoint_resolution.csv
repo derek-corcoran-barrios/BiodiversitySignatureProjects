@@ -1,0 +1,3 @@
+candidate_path,exists,selected
+Optimization/gudenaa_new_area_200m_30pct_existing_adjacency_thr1_forest_rule/coarse_biodiversity_benefits.rds,TRUE,TRUE
+Optimization/gudenaa_new_area_200m_30pct/coarse_biodiversity_benefits.rds,TRUE,FALSE

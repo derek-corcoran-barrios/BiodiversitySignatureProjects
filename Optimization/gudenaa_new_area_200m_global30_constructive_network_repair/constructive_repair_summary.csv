@@ -1,0 +1,2 @@
+chosen_connection,stage1_global_certificate_ha,constructed_global_certificate_ha,added_cells,added_restoration_ha,removed_cells,removed_restoration_ha,final_restoration_ha,final_nature_ha,final_nature_percent,all_five_certificates_pass
+Subarea2,3647.400000000002,5387.060000000003,8,18.980000000000018,2,3.62,7284.580000000006,13270.23000000001,30.036211457862738,TRUE

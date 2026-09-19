@@ -1,0 +1,4 @@
+stage	solve_result	solve_result_num	objective_value	total_shortfall_ha	footprint_change_ha	footprint_limit_ha
+1_network_feasibility	solved	0	0.0000000000	0.00000000	.	19690.94000000
+2_minimum_footprint_change	limit	402	1956.1900000000	0.00000000	1956.19000000	19690.94000000
+3_ecological_contiguity_quality	limit	402	1.5626000376	0.00000000	1956.11000000	1956.20000000

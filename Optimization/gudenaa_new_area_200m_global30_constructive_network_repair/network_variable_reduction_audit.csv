@@ -1,0 +1,6 @@
+network_name,eligible_cells,eligible_patches,directed_cell_arcs,cell_patch_edges
+Global,2201,852,6652,2038
+Subarea1,2201,852,6652,2038
+Subarea2,2201,852,6652,2038
+Subarea3,2237,860,7048,1837
+Subarea4,2082,254,7212,710

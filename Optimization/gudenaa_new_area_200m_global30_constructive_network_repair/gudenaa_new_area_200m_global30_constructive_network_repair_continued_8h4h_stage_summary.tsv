@@ -1,0 +1,3 @@
+stage	solve_result	solve_result_num	objective_value	total_shortfall_ha	footprint_change_ha	footprint_limit_ha	time_limit_seconds
+2_minimum_footprint_change	limit	402	1145.1900000000	0.00000000	1145.19000000	19690.94000000	28800
+3_ecological_contiguity_quality	limit	402	1.5079963066	0.00000000	1144.80000000	1145.20000000	14400

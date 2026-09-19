@@ -1,0 +1,5 @@
+target_network,reachable,path_added_ha,certified_area_ha,path_nodes,global_member_cells,global_member_patches,chosen
+Subarea1,TRUE,0,3647.400000000002,1,859,205,FALSE
+Subarea2,TRUE,18.980000000000018,5387.060000000003,80,1199,428,TRUE
+Subarea3,FALSE,Inf,NA,0,0,0,FALSE
+Subarea4,FALSE,Inf,NA,0,0,0,FALSE

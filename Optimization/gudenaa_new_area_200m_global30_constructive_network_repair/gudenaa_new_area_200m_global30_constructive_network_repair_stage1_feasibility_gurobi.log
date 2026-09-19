@@ -1,0 +1,36 @@
+
+Gurobi 13.0.2 (win64) logging started Thu Sep 17 19:28:25 2026
+
+Set parameter LogFile to value "Optimization/gudenaa_new_area_200m_global30_constructive_network_repair/gudenaa_new_area_200m_global30_constructive_network_repair_stage1_feasibility_gurobi.log"
+Set parameter OutputFlag to value 1
+Set parameter InfUnbdInfo to value 1
+Gurobi Optimizer version 13.0.2 build v13.0.2rc1 (win64 - Windows Server 2022.0 (20348.2))
+
+CPU model: Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz, instruction set [SSE2|AVX|AVX2|AVX512]
+Thread count: 48 physical cores, 96 logical processors, using up to 32 threads
+
+Non-default parameters:
+TimeLimit  600
+MIPGap  0
+InfUnbdInfo  1
+
+Optimize a model with 392635 rows, 203192 columns and 1045371 nonzeros (Min)
+Model fingerprint: 0xccc5be28
+Model has 5 linear objective coefficients
+Variable types: 55213 continuous, 147979 integer (0 binary)
+Coefficient statistics:
+  Matrix range     [5e-04, 9e+03]
+  Objective range  [2e-04, 1e-03]
+  Bounds range     [1e+00, 5e+03]
+  RHS range        [1e+00, 1e+04]
+
+Loaded user MIP start with objective 0
+
+
+Explored 0 nodes (0 simplex iterations) in 0.07 seconds (0.00 work units)
+Thread count was 1 (of 96 available processors)
+
+Solution count 2: 0 0 
+
+Optimal solution found (tolerance 0.00e+00)
+Best objective 0.000000000000e+00, best bound 0.000000000000e+00, gap 0.0000%

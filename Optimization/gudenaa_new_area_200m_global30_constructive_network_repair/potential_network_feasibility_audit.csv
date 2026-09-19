@@ -1,0 +1,6 @@
+network_name,RequiredAreaHa,feasible_potential_components,largest_potential_certificate_ha
+Global,5000,1,8657.950000000004
+Subarea1,1000,1,6079.852473608402
+Subarea2,1000,1,2223.252520629884
+Subarea3,1000,2,3876.7420578125025
+Subarea4,1000,2,3882.582626293948
