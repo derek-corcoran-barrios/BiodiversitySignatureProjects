@@ -1,0 +1,35 @@
+{
+  "version": "3.0",
+  "date": "2026-10-07",
+  "sources": [
+    {
+      "filename": "gudenaa_pipeline_v1.zip",
+      "library_file_id": "libfile_c262426d3350819180c3a5990b4776c8",
+      "sha256": "8cfc350c6637356bee7ae95be9288948bbdf222af62c55e884612b4cc913010c",
+      "source_library_version": "0"
+    },
+    {
+      "filename": "targets_plant_biodiversity.R",
+      "library_file_id": "libfile_b6c45c0738388191b6338bd62782d1c3",
+      "sha256": "4ba7423e38a3b98d3be59a97f27defa5ddb78ed8c0f1f520881ddfe7e83f64ec",
+      "source_library_version": "0"
+    },
+    {
+      "filename": "02_build_gudenaa_scenarios.Rmd",
+      "library_file_id": "libfile_6c1cc942af1c8191a8023a456c7c8d19",
+      "sha256": "0b1c42c17f5587fb88b17cf81af792eef32a01b49eb5fab02f5fa13fa7e1c267",
+      "source_library_version": "1"
+    },
+    {
+      "filename": "01-SpeciesPoolRArticle.pdf",
+      "library_file_id": null,
+      "sha256": "fd1a1fe5dce595996bd02156c86e94ee00cf89fcdfda54b4a5b57a9f9ff1342e"
+    }
+  ],
+  "previous_release": {
+    "filename": "denmark_pipeline_v2.zip",
+    "library_file_id": "libfile_c262426d3350819180c3a5990b4776c8",
+    "source_library_version": "1",
+    "sha256": "5d01590563b0c1893d4a8f0b99904654dc69c072eaf50102bd1877b294d4e586"
+  }
+}

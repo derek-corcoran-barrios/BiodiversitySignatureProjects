@@ -1,0 +1,15 @@
+source("gudenaa_pipeline/R/compare_footprints.R")
+source("gudenaa_pipeline/R/pipeline.R")
+d <- data.frame(coarse_cell_id = 1:4, EligibleAreaHa = c(1, 2, 3, 4))
+a <- data.frame(coarse_cell_id = c(1, 2))
+b <- data.frame(coarse_cell_id = c(2, 3))
+r <- compare_gudenaa_footprints(a, b, d, "grid-A", "grid-A")
+stopifnot(r$summary$both_ha == 2, r$summary$symmetric_difference_ha == 4,
+          abs(r$summary$area_weighted_jaccard - 1/3) < 1e-12)
+stopifnot(inherits(try(compare_gudenaa_footprints(a, b, d, "A", "B"), silent=TRUE), "try-error"))
+stopifnot(inherits(try(compare_gudenaa_footprints(rbind(a, a[1,]), b, d, "A", "A"), silent=TRUE), "try-error"))
+b$restored_ha <- c(2, 1)
+stopifnot(inherits(try(compare_gudenaa_footprints(a, b, d, "A", "A"), silent=TRUE), "try-error"))
+stopifnot(gp_accepted_result(0), gp_accepted_result(400), !gp_accepted_result(450),
+          !gp_accepted_result(200), !gp_accepted_result(NA_real_))
+cat("Comparison and status tests passed.\n")

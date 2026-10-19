@@ -1,0 +1,22 @@
+[
+  {
+    "source": "07_gudenaa_new_area_200m_existing_adjacency(3).Rmd",
+    "sha256": "9b9820a92c7a732c54ef3ff9ecc7ee342a128114661d37cc80bdcc40c7dc8d24"
+  },
+  {
+    "source": "08a_gudenaa_new_area_200m_global30_feasible_network_repair(2).Rmd",
+    "sha256": "cac3c0e8dc8645a1c8c72b17345cc4c3ae0e1e36f13e199cdf26b392d557dfd0"
+  },
+  {
+    "source": "08b_gudenaa_new_area_200m_constructive_network_repair(1).Rmd",
+    "sha256": "8a0106019bb57d8aadfc53c461ccc301d31e5c4d71988da8c6e4f4d3c4a68c39"
+  },
+  {
+    "source": "Gudenaa_global30_feasible_network_repair_200m(1).mod",
+    "sha256": "f238faf2b0964e8ab32f39a51d25bfcd507900e3a3c860d9d7186c63fdc3dd14"
+  },
+  {
+    "source": "09_plot_gudenaa_incumbent.R",
+    "sha256": "c848b47141579db69c0662b8684c589cfd445cabb54417fe5a2c79addf13f13d"
+  }
+]
